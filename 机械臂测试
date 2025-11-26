@@ -1,0 +1,439 @@
+import time
+from pydobot import Dobot
+
+class SuctionArm:
+    """
+    Dobot Magician 机械臂吸盘控制类
+    专门用于控制吸盘进行拾取和放置操作
+    """
+    
+    def __init__(self, port='/dev/ttyUSB0', verbose=True):
+        """
+        初始化机械臂连接
+        
+        Args:
+            port: 串口设备路径
+            verbose: 是否显示详细操作信息
+        """
+        self.port = port
+        self.verbose = verbose
+        self.dobot = None
+        self.is_connected = False
+        
+        # 吸盘参数
+        self.suction_enabled = False
+        self.suction_duration = 1.0  # 吸盘动作持续时间(秒)
+        
+        # 安全运动参数
+        self.lift_height = 50        # 抬起高度(mm)
+        self.approach_speed = 50     # 接近速度
+        self.pick_height = 5         # 拾取高度(距离物体表面)
+        
+        # 预设位置
+        self.home_position = (200, 0, 100, 0)
+        self.pickup_zone = (250, 0, 0, 0)    # 拾取区域
+        self.placement_zone = (150, 150, 0, 0)  # 放置区域
+        
+        self.connect()
+    
+    def connect(self):
+        """连接机械臂"""
+        print(f"🔌 连接 Dobot Magician ({self.port})...")
+        try:
+            self.dobot = Dobot(port=self.port, verbose=False)
+            
+            # 获取当前位置
+            current_pose = self.dobot.pose()
+            print(f"📍 当前位置: X={current_pose[0]:.2f}, Y={current_pose[1]:.2f}, Z={current_pose[2]:.2f}")
+            
+            # 设置速度
+            if hasattr(self.dobot, 'speed'):
+                self.dobot.speed(100, 100)
+            
+            self.is_connected = True
+            print("✅ 连接成功！")
+            
+        except Exception as e:
+            print(f"❌ 连接失败: {e}")
+            self.is_connected = False
+    
+    def set_suction(self, enable):
+        """
+        控制吸盘开关
+        
+        Args:
+            enable: True开启吸盘，False关闭吸盘
+        """
+        if not self.is_connected:
+            print("❌ 机械臂未连接")
+            return False
+        
+        try:
+            self.dobot.suck(enable)
+            self.suction_enabled = enable
+            
+            action = "开启" if enable else "关闭"
+            status = "🔴 吸盘工作中" if enable else "⚪ 吸盘关闭"
+            
+            if self.verbose:
+                print(f"🔄 {status} - {action}吸盘")
+            
+            # 等待吸盘稳定
+            time.sleep(self.suction_duration)
+            return True
+            
+        except Exception as e:
+            print(f"❌ 吸盘控制失败: {e}")
+            return False
+    
+    def move_to_safe(self, x, y, z, r=0, wait=True):
+        """
+        安全移动到指定位置（先抬起到安全高度）
+        
+        Args:
+            x, y, z, r: 目标坐标
+            wait: 是否等待移动完成
+        """
+        if not self.is_connected:
+            return False
+        
+        # 获取当前位置
+        current_pose = self.dobot.pose()
+        current_z = current_pose[2]
+        
+        # 如果当前位置较低，先抬起到安全高度
+        if current_z < self.lift_height:
+            self.dobot.move_to(current_pose[0], current_pose[1], self.lift_height, current_pose[3], wait=True)
+            time.sleep(0.5)
+        
+        # 移动到目标位置的安全高度
+        self.dobot.move_to(x, y, self.lift_height, r, wait=True)
+        time.sleep(0.5)
+        
+        # 下降到目标高度
+        self.dobot.move_to(x, y, z, r, wait=wait)
+        if wait:
+            time.sleep(0.5)
+        
+        if self.verbose:
+            print(f"✈️  移动到: X={x}, Y={y}, Z={z}")
+        
+        return True
+    
+    def pick_object(self, x, y, z=0, object_height=10):
+        """
+        拾取物体
+        
+        Args:
+            x, y: 物体位置坐标
+            z: 物体表面高度
+            object_height: 物体高度(mm)
+        """
+        if not self.is_connected:
+            return False
+        
+        print(f"🎯 开始拾取物体: ({x}, {y}, {z})")
+        
+        try:
+            # 步骤1: 移动到物体上方安全位置
+            self.move_to_safe(x, y, z + self.lift_height)
+            
+            # 步骤2: 下降到拾取高度
+            pickup_z = z + self.pick_height
+            self.dobot.move_to(x, y, pickup_z, 0, wait=True)
+            time.sleep(0.5)
+            
+            if self.verbose:
+                print(f"⬇️  下降到拾取高度: Z={pickup_z}")
+            
+            # 步骤3: 开启吸盘
+            if not self.set_suction(True):
+                return False
+            
+            # 步骤4: 短暂等待确保吸牢
+            time.sleep(0.5)
+            
+            # 步骤5: 抬起物体到安全高度
+            lift_z = z + object_height + self.lift_height
+            self.dobot.move_to(x, y, lift_z, 0, wait=True)
+            
+            if self.verbose:
+                print(f"⬆️  抬起物体到安全高度: Z={lift_z}")
+            
+            print("✅ 拾取完成！")
+            return True
+            
+        except Exception as e:
+            print(f"❌ 拾取失败: {e}")
+            # 确保吸盘关闭
+            self.set_suction(False)
+            return False
+    
+    def place_object(self, x, y, z=0, object_height=10):
+        """
+        放置物体
+        
+        Args:
+            x, y: 放置位置坐标
+            z: 放置表面高度
+            object_height: 物体高度(mm)
+        """
+        if not self.is_connected:
+            return False
+        
+        print(f"🎯 开始放置物体: ({x}, {y}, {z})")
+        
+        try:
+            # 步骤1: 移动到放置位置上方
+            self.move_to_safe(x, y, z + object_height + self.lift_height)
+            
+            # 步骤2: 下降到放置高度
+            place_z = z + self.pick_height
+            self.dobot.move_to(x, y, place_z, 0, wait=True)
+            time.sleep(0.5)
+            
+            if self.verbose:
+                print(f"⬇️  下降到放置高度: Z={place_z}")
+            
+            # 步骤3: 关闭吸盘
+            if not self.set_suction(False):
+                return False
+            
+            # 步骤4: 等待物体稳定放置
+            time.sleep(0.5)
+            
+            # 步骤5: 抬起到安全高度
+            self.dobot.move_to(x, y, z + self.lift_height, 0, wait=True)
+            
+            if self.verbose:
+                print("⬆️  抬起到安全高度")
+            
+            print("✅ 放置完成！")
+            return True
+            
+        except Exception as e:
+            print(f"❌ 放置失败: {e}")
+            return False
+    
+    def pick_and_place(self, pick_x, pick_y, place_x, place_y, 
+                      pick_z=0, place_z=0, object_height=10):
+        """
+        完整的拾取和放置操作
+        
+        Args:
+            pick_x, pick_y: 拾取位置
+            place_x, place_y: 放置位置
+            pick_z, place_z: 高度坐标
+            object_height: 物体高度
+        """
+        print(f"\n🔄 开始拾取放置操作:")
+        print(f"   拾取位置: ({pick_x}, {pick_y}, {pick_z})")
+        print(f"   放置位置: ({place_x}, {place_y}, {place_z})")
+        
+        # 拾取物体
+        if self.pick_object(pick_x, pick_y, pick_z, object_height):
+            # 放置物体
+            if self.place_object(place_x, place_y, place_z, object_height):
+                print("🎉 拾取放置操作成功完成！")
+                return True
+            else:
+                print("❌ 放置失败，物体仍在吸盘上")
+                # 紧急情况：回到安全位置并释放物体
+                self.move_to_safe(self.home_position[0], self.home_position[1], self.home_position[2])
+                self.set_suction(False)
+                return False
+        else:
+            print("❌ 拾取失败")
+            return False
+    
+    def test_suction(self):
+        """测试吸盘功能"""
+        print("\n🧪 开始吸盘测试...")
+        
+        # 测试开启吸盘
+        print("1. 测试开启吸盘...")
+        if self.set_suction(True):
+            print("✅ 吸盘开启测试成功")
+        else:
+            print("❌ 吸盘开启测试失败")
+            return False
+        
+        time.sleep(2)
+        
+        # 测试关闭吸盘
+        print("2. 测试关闭吸盘...")
+        if self.set_suction(False):
+            print("✅ 吸盘关闭测试成功")
+        else:
+            print("❌ 吸盘关闭测试失败")
+            return False
+        
+        print("🎉 吸盘测试全部完成！")
+        return True
+    
+    def calibration_routine(self):
+        """校准程序"""
+        print("\n🎯 开始校准程序...")
+        print("请确保:")
+        print("1. 机械臂工作区域内没有障碍物")
+        print("2. 吸盘清洁无堵塞")
+        print("3. 气源连接正常")
+        
+        input("按回车键开始校准...")
+        
+        # 移动到安全位置
+        self.move_to_safe(*self.home_position)
+        
+        # 测试吸盘
+        if not self.test_suction():
+            return False
+        
+        # 测试拾取放置循环
+        print("\n3. 测试拾取放置循环...")
+        success = self.pick_and_place(
+            pick_x=250, pick_y=0, 
+            place_x=150, place_y=150,
+            pick_z=0, place_z=0,
+            object_height=10
+        )
+        
+        if success:
+            print("✅ 校准完成！系统准备就绪")
+        else:
+            print("❌ 校准失败，请检查系统")
+        
+        return success
+    
+    def auto_pick_place_demo(self, num_cycles=3):
+        """自动拾取放置演示"""
+        print(f"\n🤖 开始自动拾取放置演示 ({num_cycles} 次循环)")
+        
+        for i in range(num_cycles):
+            print(f"\n--- 第 {i+1} 次循环 ---")
+            
+            # 在不同位置间移动物体
+            positions = [
+                ((250, 0), (150, 150)),   # 位置1到位置2
+                ((150, 150), (150, -150)), # 位置2到位置3
+                ((150, -150), (250, 0))    # 位置3回到位置1
+            ]
+            
+            for (pick_pos, place_pos) in positions:
+                success = self.pick_and_place(
+                    pick_x=pick_pos[0], pick_y=pick_pos[1],
+                    place_x=place_pos[0], place_y=place_pos[1],
+                    pick_z=0, place_z=0,
+                    object_height=10
+                )
+                
+                if not success:
+                    print("❌ 演示中断")
+                    return False
+                
+                time.sleep(1)
+        
+        print("🎉 自动演示完成！")
+        return True
+    
+    def get_status(self):
+        """获取系统状态"""
+        if not self.is_connected:
+            return "❌ 未连接"
+        
+        pose = self.dobot.pose()
+        suction_status = "🔴 工作中" if self.suction_enabled else "⚪ 关闭"
+        
+        status = f"""
+🤖 机械臂状态:
+📍 位置: X={pose[0]:.1f}, Y={pose[1]:.1f}, Z={pose[2]:.1f}
+🔄 吸盘: {suction_status}
+🔗 连接: ✅ 已连接
+        """
+        return status
+    
+    def disconnect(self):
+        """断开连接"""
+        if self.dobot:
+            # 确保吸盘关闭
+            self.set_suction(False)
+            # 回到安全位置
+            self.move_to_safe(*self.home_position)
+            self.dobot.close()
+            print("🔌 已断开连接")
+
+
+def main():
+    """主程序"""
+    print("=" * 60)
+    print("            Dobot Magician 吸盘控制系统")
+    print("=" * 60)
+    
+    # 初始化机械臂
+    arm = SuctionArm(port='/dev/ttyUSB0', verbose=True)
+    
+    if not arm.is_connected:
+        print("无法启动系统，请检查连接")
+        return
+    
+    try:
+        while True:
+            print("\n" + "=" * 40)
+            print("请选择操作:")
+            print("1. 🧪 吸盘测试")
+            print("2. 🎯 校准程序")
+            print("3. 🤖 自动演示")
+            print("4. 🎯 单次拾取放置")
+            print("5. 📊 系统状态")
+            print("6. ❌ 退出")
+            print("=" * 40)
+            
+            choice = input("请输入选择 (1-6): ").strip()
+            
+            if choice == '1':
+                arm.test_suction()
+                
+            elif choice == '2':
+                arm.calibration_routine()
+                
+            elif choice == '3':
+                cycles = input("请输入循环次数 (默认 3): ").strip()
+                try:
+                    cycles = int(cycles) if cycles else 3
+                    arm.auto_pick_place_demo(cycles)
+                except ValueError:
+                    print("❌ 输入无效，使用默认值 3")
+                    arm.auto_pick_place_demo()
+                    
+            elif choice == '4':
+                try:
+                    pick_x = float(input("拾取位置 X (默认 250): ") or 250)
+                    pick_y = float(input("拾取位置 Y (默认 0): ") or 0)
+                    place_x = float(input("放置位置 X (默认 150): ") or 150)
+                    place_y = float(input("放置位置 Y (默认 150): ") or 150)
+                    
+                    arm.pick_and_place(pick_x, pick_y, place_x, place_y)
+                except ValueError:
+                    print("❌ 输入无效，请输入数字")
+                    
+            elif choice == '5':
+                print(arm.get_status())
+                
+            elif choice == '6':
+                print("谢谢使用！")
+                break
+                
+            else:
+                print("❌ 无效选择，请重新输入")
+                
+            input("\n按回车键继续...")
+            
+    except KeyboardInterrupt:
+        print("\n\n⏹️ 用户中断程序")
+    except Exception as e:
+        print(f"\n❌ 程序错误: {e}")
+    finally:
+        arm.disconnect()
+
+
+if __name__ == "__main__":
+    main()
