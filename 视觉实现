@@ -1,0 +1,364 @@
+# -*- coding: gbk -*-
+import cv2
+import numpy as np
+import time
+from enum import Enum
+from collections import namedtuple
+
+# ----------------- Exceptions and Constants -----------------
+
+# Define the custom exception used in the original code
+class ChessboardNotFoundError(Exception):
+    """Raised when the four corner markers are not found in the image."""
+    pass
+
+# Image dimensions for warping the perspective
+# Feel free to adjust these values (e.g., to 1280, 720) if your camera supports higher resolution and you need more detail.
+width, height = 640, 480
+
+# Named tuple for coordinates
+Point = namedtuple("Point", ["x", "y"])
+
+
+# Colors in BGR mode, used by opencv.
+class Colors(Enum):
+    white = (255, 255, 255)
+    black = (0, 0, 0)
+    blue = (255, 0, 0)
+    green = (0, 255, 0)
+    red = (0, 0, 255)
+    pink = (255, 0, 255) # Custom addition for the fourth corner color
+
+# The "type" of a piece is the color of the pattern, not the background.
+class SquareType(Enum):
+    empty = 0
+    white = 1
+    black = 2
+
+    def __str__(self):
+        if self == SquareType.empty:
+            return ' '
+        if self == SquareType.white:
+            return 'o'
+        if self == SquareType.black:
+            return 'x'
+        return '?'
+
+
+# ----------------- Image Processing Functions -----------------
+
+# Returns the four corners of the chessboard, or None if not found.
+# Red: Upper left
+# Green: Upper right
+# Blue: Bottom left
+# Pink: Bottom right
+def find_corners(image):
+    # Draw a circle at [center] with [radius]
+    def draw_circle(image, center, radius=5, color=Colors.white):
+        cv2.circle(image, center, radius, color.value, 2)
+
+    # Return a new image converted to black & white
+    def threshold(image):
+        # Apply slight blur to smooth out noise
+        blurred = cv2.blur(image, (5, 5))
+        # Use a high threshold value to isolate bright color markers
+        ret, thresholded = cv2.threshold(blurred, 200, 255, cv2.THRESH_BINARY)
+        return thresholded
+
+    # Extract center point from largest contour in a black & white image
+    def find_point(image):
+        def center(contour):
+            # Calculate the bounding box and return its center
+            x, y, w, h = cv2.boundingRect(contour)
+            return Point(x + w // 2, y + h // 2)
+
+        # Find all external contours
+        # Note: cv2.findContours returns different number of values in different OpenCV versions.
+        contours, _ = cv2.findContours(
+            image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        
+        # If no contours are found, or the largest one is too small, return None
+        if len(contours) < 1:
+            return None
+        
+        contour = max(contours, key=cv2.contourArea)
+        
+        # Simple area check to filter out tiny noise (adjust if needed)
+        if cv2.contourArea(contour) < 50:
+             return None
+
+        return center(contour)
+
+    # Convert to HSV color space for easier color detection
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    
+    # Define masks for the four marker colors (Red, Green, Blue, Pink)
+    masks = [
+        # Red (Split hue range 0-10 and 160-180)
+        cv2.bitwise_or(
+            cv2.inRange(hsv, (160, 60, 100), (180, 255, 255)),
+            cv2.inRange(hsv, (0, 60, 100), (10, 255, 255)),
+        ),
+        # Green (Hue 60-90)
+        cv2.inRange(hsv, (50, 60, 100), (90, 255, 255)),
+        # Blue (Hue 90-120)
+        cv2.inRange(hsv, (90, 100, 100), (130, 255, 255)),
+        # Pink/Magenta (Hue 130-160)
+        cv2.inRange(hsv, (130, 30, 100), (160, 255, 255)),
+    ]
+    
+    # Find the center point for each color mask
+    points = [find_point(threshold(mask)) for mask in masks]
+
+    # Check if all four points were found
+    if not all(points):
+        return None
+
+    # Unpack points for adjustment calculation (as in original code)
+    x0, y0 = points[0] # Red (Top-Left)
+    x1, y1 = points[1] # Green (Top-Right)
+    x2, y2 = points[2] # Blue (Bottom-Left)
+    x3, y3 = points[3] # Pink (Bottom-Right)
+
+    # Apply minor positional adjustments based on neighboring points (as in original code)
+    adjusted_points = [
+        Point(
+            int(x0 + (x0 - x1) * 0.00 - (x0 - x2) * 0.05),
+            int(y0 + (y0 - y1) * 0.00 - (y0 - y2) * 0.05),
+        ),
+        Point(
+            int(x1 + (x1 - x0) * 0.08 - (x1 - x3) * 0.05),
+            int(y1 + (y1 - y0) * 0.08 - (y1 - y3) * 0.05),
+        ),
+        Point(
+            int(x2 + (x2 - x3) * 0.02 - (x2 - x0) * 0.05),
+            int(y2 + (y2 - y3) * 0.02 - (y2 - y0) * 0.05),
+        ),
+        Point(
+            int(x3 + (x3 - x2) * 0.08 - (x3 - x1) * 0.05),
+            int(y3 + (y3 - y2) * 0.08 - (y3 - y1) * 0.05),
+        ),
+    ]
+
+    # Visualize the detected corners on the original image for debugging
+    draw_circle(image, adjusted_points[0], color=Colors.red)
+    draw_circle(image, adjusted_points[1], color=Colors.green)
+    draw_circle(image, adjusted_points[2], color=Colors.blue)
+    draw_circle(image, adjusted_points[3], color=Colors.pink)
+
+    return adjusted_points
+
+
+# Returns a new image after a perspective transform,
+# moving [corners] to the corners of the image.
+def transform(image, corners):
+    # Source points (the detected corners)
+    src = np.array(
+        [
+            (corners[0].x, corners[0].y), # Top-Left (Red)
+            (corners[1].x, corners[1].y), # Top-Right (Green)
+            (corners[2].x, corners[2].y), # Bottom-Left (Blue)
+            (corners[3].x, corners[3].y), # Bottom-Right (Pink)
+        ], np.float32)
+
+    # Destination points (the corners of the target image)
+    dst = np.array(
+        [
+            (0, 0),
+            (width, 0),
+            (0, height),
+            (width, height),
+        ], np.float32)
+
+    # Calculate the perspective transformation matrix
+    matrix = cv2.getPerspectiveTransform(src, dst)
+    # Apply the perspective transformation
+    return cv2.warpPerspective(image, matrix, (width, height))
+
+
+# Return the square type of the given image (usually a crop of the original).
+def detect_square_type(image):
+    # Crop the edges away to focus on the center where the piece should be
+    h, w, _ = image.shape
+    image_roi = image[int(h * 0.15) : int(h * 0.85), int(w * 0.15) : int(w * 0.85)]
+
+    # Convert the ROI to grayscale and then apply binary threshold
+    image_roi = cv2.cvtColor(image_roi, cv2.COLOR_BGR2GRAY)
+    # Binary threshold to get a clean black & white image (Piece or Background)
+    _, image_bw = cv2.threshold(image_roi, 125, 255, cv2.THRESH_BINARY)
+    
+    # Create a copy for floodfill operations
+    image_test = image_bw.copy()
+
+    # Helper function to check if the square is mostly empty/single-colored
+    def is_empty(img):
+        # Calculate the ratio of white pixels
+        percentage = cv2.countNonZero(img) / (img.size)
+        # If the ratio is very low (mostly black) or very high (mostly white), consider it empty
+        # This assumes an "empty" square has no prominent, central piece pattern
+        return percentage < 0.05 or percentage > 0.95
+
+    # Helper function to floodfill from the corners
+    def floodfill_from_corners(img, color_value):
+        h_test, w_test = img.shape
+        # Mask must be 2 pixels larger than the image
+        mask = np.zeros((h_test + 2, w_test + 2), np.uint8)
+        seeds = [
+            (0, 0),
+            (w_test - 1, 0),
+            (0, h_test - 1),
+            (w_test - 1, h_test - 1),
+        ]
+        for seed in seeds:
+            # Floodfill the image, changing the color of connected pixels
+            cv2.floodFill(img, mask, seed, color_value)
+
+    # 1. Check for 'Empty' square first
+    if is_empty(image_test):
+        # If the original ROI is already close to all white or all black, assume empty.
+        return SquareType.empty
+    
+    # 2. Check for 'Black' piece (Black pattern on White background, or vice versa)
+    # Floodfill with black (0) from the corners. This should "fill in" the background.
+    # If the piece is 'black' (dark pattern), the floodfill won't cover it.
+    floodfill_from_corners(image_test, 0) # Fill background (assuming it's light)
+
+    if is_empty(image_test):
+        # If the whole image is now black (0), it means the original pattern (the piece)
+        # was also dark, and the floodfill must have failed or covered it.
+        # Given the original logic structure, we assume if it empties out after
+        # filling with the *opposite* color (0 for black), it was a black piece.
+        return SquareType.black
+
+    # 3. Check for 'White' piece
+    # Now floodfill with white (255)
+    floodfill_from_corners(image_test, 255) 
+
+    if is_empty(image_test):
+        # If the image is now all white, the piece must have been white (light pattern).
+        return SquareType.white
+    else:
+        # If after both floodfills, the ROI is still not empty, 
+        # the detection logic defaults back to black.
+        return SquareType.black
+
+
+# Recognize the chessboard in the image, and returns the corresponding position.
+# A position is an 8x8 array of SquareType.
+def get_position_from_image(image):
+    # Crop the image into 8x8 squares.
+    # Returns the square on the jth row, ith column (zero based).
+    def crop(image, i, j):
+        w_size = int(width / 8)
+        h_size = int(height / 8)
+        # Note: image[row_start:row_end, col_start:col_end]
+        return image[h_size * j : h_size * (j + 1), w_size * i : w_size * (i + 1)]
+
+    # 1. Find the four corner markers
+    corners = find_corners(image)
+    if corners is None:
+        raise ChessboardNotFoundError()
+
+    # 2. Transform the perspective to get a flat 8x8 board image
+    chessboard_image = transform(image.copy(), corners)
+    
+    # Display the flattened board (will appear in a separate window)
+    cv2.imshow("Flattened Chess Board", chessboard_image)
+
+    # 3. Analyze each square
+    position = []
+    for j in range(8): # Rows (0 to 7)
+        row = []
+        for i in range(8): # Columns (0 to 7)
+            square_crop = crop(chessboard_image, i, j)
+            square_type = detect_square_type(square_crop)
+            row.append(square_type)
+        position.append(row)
+        
+    return position
+
+# ----------------- Main Execution Loop -----------------
+
+def main():
+    # 尝试打开第一个摄像头 (索引 0)
+    cap = cv2.VideoCapture(0)
+
+    # 设置捕获分辨率
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+    if not cap.isOpened():
+        print("错误: 无法打开摄像头。请检查摄像头索引或权限。")
+        return
+
+    print("--- 棋盘检测程序启动 ---")
+    print("目标: 检测带有红、绿、蓝、粉四个角标的棋盘。")
+    print(f"检测窗口分辨率: {width}x{height}")
+    print("按 'q' 键退出程序。")
+    print("\n-------------------")
+
+    while True:
+        # 捕获帧
+        ret, frame = cap.read()
+        if not ret:
+            print("警告: 无法从摄像头接收帧，正在退出...")
+            break
+
+        # 调整帧大小以匹配设置的检测分辨率
+        frame = cv2.resize(frame, (width, height))
+        
+        position = None
+        try:
+            # 调用核心检测函数
+            position = get_position_from_image(frame)
+            
+            # 打印检测到的棋盘状态到控制台
+            print(f"\rDetected Position (x=black, o=white, ' '=empty):")
+            for row in position:
+                print(" | ".join(map(str, row)), end='\n')
+            print("-------------------", end='')
+
+
+        except ChessboardNotFoundError:
+            # 如果未找到四个角标，则捕获异常并显示消息
+            cv2.putText(
+                frame, 
+                "Place the 8x8 chessboard with 4 color markers (Red, Green, Blue, Pink).", 
+                (20, 30), 
+                cv2.FONT_HERSHEY_SIMPLEX, 
+                0.6, 
+                Colors.red.value, 
+                2
+            )
+            # Clear previous console output
+            print("\rWaiting for Chessboard...")
+
+        except Exception as e:
+            # 捕获其他运行时错误
+            cv2.putText(
+                frame, 
+                f"ERROR: {e.__class__.__name__}", 
+                (20, 60), 
+                cv2.FONT_HERSHEY_SIMPLEX, 
+                0.7, 
+                Colors.red.value, 
+                2
+            )
+            print(f"运行时错误: {e}")
+
+        # 显示原始的摄像头画面 (已经标注了角标)
+        cv2.imshow("Webcam Feed - Find Markers", frame)
+
+        # 检查是否按下 'q' 键
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    # 释放资源并关闭所有窗口
+    cap.release()
+    cv2.destroyAllWindows()
+    print("\n--- 程序已退出 ---")
+
+
+if __name__ == "__main__":
+    main()
