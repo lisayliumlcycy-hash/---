@@ -1,0 +1,454 @@
+import time
+from pydobot import Dobot
+import json
+import os
+from IPython.display import display, clear_output
+import ipywidgets as widgets
+
+# 棋盘标定结果保存文件
+CALIBRATION_FILE = "chessboard_calibration.json"
+
+class SuctionArm:
+    def __init__(self, port='/dev/ttyUSB0', verbose=True):
+        self.port = port
+        self.verbose = verbose
+        self.dobot = None
+        self.is_connected = False
+        
+        # 运动参数
+        self.move_speed = 50
+        self.move_distance = 10  # 单次移动距离(mm)
+        self.fine_move_distance = 2  # 精细移动距离(mm)
+        
+        # 吸盘参数
+        self.suction_duration = 1.0
+        self.lift_height = 80
+        self.pick_height = 3
+        self.approach_speed = 50
+        
+        # 棋盘标定数据
+        self.board_calibrated = False
+        self.square_size = 0
+        self.board_origin = None
+        self.board_z = 0
+        
+        self.home_position = (200, 0, 100, 0)
+        
+        self.connect()
+        self.load_calibration()
+        
+        # 创建控制界面
+        self.create_control_panel()
+
+    def connect(self):
+        try:
+            self.dobot = Dobot(port=self.port, verbose=self.verbose)
+            self.is_connected = True
+            print(f"✅ 成功连接到机械臂，端口: {self.port}")
+        except Exception as e:
+            print(f"❌ 连接机械臂失败: {e}")
+            self.is_connected = False
+
+    def disconnect(self):
+        if self.dobot:
+            self.dobot.close()
+            self.is_connected = False
+            print("🔌 机械臂已断开连接")
+
+    def set_suction(self, enable=True):
+        """控制吸盘"""
+        if not self.is_connected:
+            print("❌ 机械臂未连接")
+            return False
+        
+        self.dobot.suck(enable)
+        time.sleep(0.5)
+        if enable:
+            print("🧲 吸盘开启")
+        else:
+            print("🔓 吸盘关闭")
+        return True
+
+    def get_current_position(self):
+        """获取当前位置坐标"""
+        if not self.is_connected:
+            print("❌ 机械臂未连接")
+            return None
+        return self.dobot.pose()
+
+    def move_relative(self, dx=0, dy=0, dz=0):
+        """相对移动"""
+        if not self.is_connected:
+            print("❌ 机械臂未连接")
+            return False
+        
+        current_pos = self.get_current_position()
+        if current_pos:
+            new_x = current_pos[0] + dx
+            new_y = current_pos[1] + dy
+            new_z = current_pos[2] + dz
+            
+            print(f"➡️  移动: X{dx:+.1f}, Y{dy:+.1f}, Z{dz:+.1f}")
+            self.dobot.move_to(new_x, new_y, new_z, current_pos[3], wait=True)
+            self.update_status()
+            return True
+        return False
+
+    def move_to_safe(self, x, y, z, r=0):
+        """安全移动到指定位置"""
+        if not self.is_connected:
+            print("❌ 机械臂未连接")
+            return False
+        
+        current_pos = self.dobot.pose()
+        self.dobot.move_to(current_pos[0], current_pos[1], self.lift_height, r, wait=True)
+        self.dobot.move_to(x, y, self.lift_height, r, wait=True)
+        self.dobot.move_to(x, y, z, r, wait=True)
+        self.update_status()
+        return True
+
+    def chess_square_to_xyz(self, file, rank):
+        """将棋盘格子转换为坐标"""
+        if not self.board_calibrated:
+            print("❌ 错误：棋盘未标定！")
+            return None
+            
+        col = ord(file) - ord('a')
+        row = 8 - rank
+        
+        x = self.board_origin[0] + col * self.square_size + self.square_size / 2
+        y = self.board_origin[1] + row * self.square_size + self.square_size / 2
+        z = self.board_z + self.pick_height
+        
+        return (x, y, z)
+
+    def move_to_chess_square(self, square_name, lift_first=True):
+        """移动到指定棋盘格子"""
+        if len(square_name) != 2:
+            print("❌ 错误：格子格式错误，应为 a1-h8")
+            return False
+            
+        file = square_name[0].lower()
+        rank = int(square_name[1])
+        
+        if file < 'a' or file > 'h' or rank < 1 or rank > 8:
+            print("❌ 错误：格子超出范围")
+            return False
+            
+        coord = self.chess_square_to_xyz(file, rank)
+        if not coord:
+            return False
+            
+        x, y, z = coord
+        print(f"🎯 移动到格子 {square_name.upper()} → ({x:.1f}, {y:.1f}, {z:.1f})")
+        
+        if lift_first:
+            self.move_to_safe(x, y, z + 30)
+        self.dobot.move_to(x, y, z, 0, wait=True)
+        time.sleep(0.5)
+        self.update_status()
+        return True
+
+    def save_calibration(self):
+        """保存标定数据"""
+        data = {
+            "square_size": self.square_size,
+            "board_origin_x": self.board_origin[0],
+            "board_origin_y": self.board_origin[1],
+            "board_z": self.board_z,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+        with open(CALIBRATION_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+        print(f"💾 标定数据已保存到 {CALIBRATION_FILE}")
+
+    def load_calibration(self):
+        """加载标定数据"""
+        if not os.path.exists(CALIBRATION_FILE):
+            return False
+        try:
+            with open(CALIBRATION_FILE) as f:
+                data = json.load(f)
+            self.square_size = data["square_size"]
+            self.board_origin = (data["board_origin_x"], data["board_origin_y"], self.board_z)
+            self.board_z = data["board_z"]
+            self.board_calibrated = True
+            print(f"📂 标定数据加载成功！格子边长 = {self.square_size}mm")
+            return True
+        except Exception as e:
+            print(f"❌ 加载标定失败: {e}")
+            return False
+
+    def create_control_panel(self):
+        """创建图形化控制面板"""
+        # 状态显示
+        self.status_label = widgets.Label(value="等待连接...")
+        
+        # 移动距离控制
+        self.distance_slider = widgets.IntSlider(
+            value=self.move_distance,
+            min=1,
+            max=50,
+            step=1,
+            description='移动距离:',
+            continuous_update=False
+        )
+        
+        # 方向控制按钮
+        button_style = {'button_color': 'lightblue', 'font_weight': 'bold'}
+        
+        self.btn_up = widgets.Button(description='⬆️ 前', layout=widgets.Layout(width='80px'), **button_style)
+        self.btn_down = widgets.Button(description='⬇️ 后', layout=widgets.Layout(width='80px'), **button_style)
+        self.btn_left = widgets.Button(description='⬅️ 左', layout=widgets.Layout(width='80px'), **button_style)
+        self.btn_right = widgets.Button(description='➡️ 右', layout=widgets.Layout(width='80px'), **button_style)
+        self.btn_up_z = widgets.Button(description='🔼 上', layout=widgets.Layout(width='80px'), **button_style)
+        self.btn_down_z = widgets.Button(description='🔽 下', layout=widgets.Layout(width='80px'), **button_style)
+        
+        # 功能按钮
+        self.btn_suction = widgets.Button(description='🧲 吸盘开关', layout=widgets.Layout(width='120px'))
+        self.btn_home = widgets.Button(description='🏠 回家', layout=widgets.Layout(width='120px'))
+        self.btn_safe = widgets.Button(description='🛡️ 安全高度', layout=widgets.Layout(width='120px'))
+        self.btn_status = widgets.Button(description='📊 刷新状态', layout=widgets.Layout(width='120px'))
+        
+        # 标定控制
+        self.calibration_point = widgets.Dropdown(
+            options=['a1', 'h1', 'a8', 'h8', 'e4'],
+            value='a1',
+            description='标定点:',
+            layout=widgets.Layout(width='200px')
+        )
+        self.btn_record = widgets.Button(description='📝 记录位置', layout=widgets.Layout(width='120px'))
+        self.btn_calculate = widgets.Button(description='📐 计算标定', layout=widgets.Layout(width='120px'))
+        self.btn_save_calib = widgets.Button(description='💾 保存标定', layout=widgets.Layout(width='120px'))
+        self.btn_test = widgets.Button(description='🧪 测试移动', layout=widgets.Layout(width='120px'))
+        
+        # 格子移动
+        self.chess_square = widgets.Text(
+            value='e4',
+            placeholder='输入格子 (如 e4)',
+            description='目标格子:',
+            layout=widgets.Layout(width='200px')
+        )
+        self.btn_move_square = widgets.Button(description='🎯 移动到格子', layout=widgets.Layout(width='120px'))
+        
+        # 连接按钮事件
+        self.btn_up.on_click(lambda x: self.move_relative(dy=self.distance_slider.value))
+        self.btn_down.on_click(lambda x: self.move_relative(dy=-self.distance_slider.value))
+        self.btn_left.on_click(lambda x: self.move_relative(dx=-self.distance_slider.value))
+        self.btn_right.on_click(lambda x: self.move_relative(dx=self.distance_slider.value))
+        self.btn_up_z.on_click(lambda x: self.move_relative(dz=self.distance_slider.value))
+        self.btn_down_z.on_click(lambda x: self.move_relative(dz=-self.distance_slider.value))
+        
+        self.btn_suction.on_click(lambda x: self.toggle_suction())
+        self.btn_home.on_click(lambda x: self.go_home())
+        self.btn_safe.on_click(lambda x: self.go_safe_height())
+        self.btn_status.on_click(lambda x: self.update_status())
+        
+        self.btn_record.on_click(lambda x: self.record_calibration_point())
+        self.btn_calculate.on_click(lambda x: self.calculate_calibration())
+        self.btn_save_calib.on_click(lambda x: self.save_calibration())
+        self.btn_test.on_click(lambda x: self.test_calibration())
+        
+        self.btn_move_square.on_click(lambda x: self.move_to_chess_square(self.chess_square.value))
+        
+        self.distance_slider.observe(self.on_distance_change, names='value')
+        
+        # 存储标定数据
+        self.calibration_data = {}
+
+    def on_distance_change(self, change):
+        """移动距离改变时的回调"""
+        self.move_distance = change['new']
+        print(f"🎯 移动距离设置为: {self.move_distance}mm")
+
+    def toggle_suction(self):
+        """切换吸盘状态"""
+        current_pos = self.get_current_position()
+        if current_pos and current_pos[2] < self.lift_height:
+            self.set_suction(not self.dobot.suck())
+        else:
+            print("⚠️  高度过高，请先降低高度再操作吸盘")
+
+    def go_home(self):
+        """回到初始位置"""
+        self.move_to_safe(*self.home_position)
+        print("🏠 回到初始位置")
+
+    def go_safe_height(self):
+        """上升到安全高度"""
+        current_pos = self.get_current_position()
+        if current_pos:
+            self.dobot.move_to(current_pos[0], current_pos[1], self.lift_height, current_pos[3], wait=True)
+            print("🛡️  上升到安全高度")
+            self.update_status()
+
+    def update_status(self):
+        """更新状态显示"""
+        pos = self.get_current_position()
+        if pos:
+            status = f"📍 当前位置: X={pos[0]:.1f}, Y={pos[1]:.1f}, Z={pos[2]:.1f}"
+            if self.board_calibrated:
+                status += f" | 棋盘已标定 (格子: {self.square_size:.1f}mm)"
+            else:
+                status += " | 棋盘未标定"
+            self.status_label.value = status
+        else:
+            self.status_label.value = "❌ 无法获取位置"
+
+    def record_calibration_point(self):
+        """记录标定点"""
+        point_name = self.calibration_point.value
+        pos = self.get_current_position()
+        if pos:
+            self.calibration_data[point_name] = (pos[0], pos[1])
+            print(f"✅ 已记录 {point_name.upper()} = ({pos[0]:.1f}, {pos[1]:.1f})")
+            
+            # 显示已记录的标定点
+            print("📋 已记录的标定点:")
+            for point, coord in self.calibration_data.items():
+                print(f"  {point.upper()}: ({coord[0]:.1f}, {coord[1]:.1f})")
+        else:
+            print("❌ 无法获取当前位置")
+
+    def calculate_calibration(self):
+        """计算标定参数"""
+        if len(self.calibration_data) < 2:
+            print("❌ 请至少记录2个标定点")
+            return
+        
+        print("📊 计算标定参数...")
+        
+        if 'a1' in self.calibration_data and 'h8' in self.calibration_data:
+            # 使用 a1 和 h8 计算
+            x_a1, y_a1 = self.calibration_data['a1']
+            x_h8, y_h8 = self.calibration_data['h8']
+            
+            # 计算格子大小
+            distance_x = abs(x_h8 - x_a1)
+            distance_y = abs(y_h8 - y_a1)
+            self.square_size = ((distance_x / 7) + (distance_y / 7)) / 2
+            
+            # 计算棋盘原点
+            self.board_origin = (x_a1 - self.square_size / 2, y_a1 - self.square_size / 2, 0)
+            
+        elif len(self.calibration_data) >= 2:
+            # 使用任意两个点计算
+            points = list(self.calibration_data.items())
+            square1, coord1 = points[0]
+            square2, coord2 = points[1]
+            
+            x1, y1 = coord1
+            x2, y2 = coord2
+            
+            # 计算格子索引差
+            file_diff = abs(ord(square2[0]) - ord(square1[0]))
+            rank_diff = abs(int(square2[1]) - int(square1[1]))
+            
+            if file_diff > 0:
+                size_x = abs(x2 - x1) / file_diff
+            else:
+                size_x = 40
+                
+            if rank_diff > 0:
+                size_y = abs(y2 - y1) / rank_diff
+            else:
+                size_y = 40
+                
+            self.square_size = (size_x + size_y) / 2
+            
+            # 使用第一个点计算原点
+            file_idx = ord(square1[0]) - ord('a')
+            rank_idx = 8 - int(square1[1])
+            self.board_origin = (x1 - file_idx * self.square_size - self.square_size/2, 
+                               y1 - rank_idx * self.square_size - self.square_size/2, 0)
+        
+        self.board_z = self.get_current_position()[2] if self.get_current_position() else 0
+        self.board_calibrated = True
+        
+        print(f"🎉 标定完成！")
+        print(f"📐 格子边长: {self.square_size:.2f} mm")
+        print(f"🎯 棋盘原点: ({self.board_origin[0]:.1f}, {self.board_origin[1]:.1f})")
+        self.update_status()
+
+    def test_calibration(self):
+        """测试标定结果"""
+        if not self.board_calibrated:
+            print("❌ 请先完成标定")
+            return
+        
+        test_squares = ['a1', 'e4', 'h8']
+        print("🧪 测试标定结果:")
+        for square in test_squares:
+            coord = self.chess_square_to_xyz(square[0], int(square[1]))
+            if coord:
+                print(f"  {square.upper()} → ({coord[0]:.1f}, {coord[1]:.1f})")
+        
+        # 实际移动到 e4 测试
+        self.move_to_chess_square("e4")
+
+    def show_control_panel(self):
+        """显示控制面板"""
+        clear_output(wait=True)
+        
+        # 创建布局
+        move_controls = widgets.VBox([
+            widgets.HBox([self.btn_up]),
+            widgets.HBox([self.btn_left, self.btn_right]),
+            widgets.HBox([self.btn_down]),
+            widgets.HBox([self.btn_up_z, self.btn_down_z])
+        ])
+        
+        basic_controls = widgets.VBox([
+            self.btn_suction,
+            self.btn_home,
+            self.btn_safe,
+            self.btn_status
+        ])
+        
+        calibration_controls = widgets.VBox([
+            self.calibration_point,
+            widgets.HBox([self.btn_record, self.btn_calculate]),
+            widgets.HBox([self.btn_save_calib, self.btn_test])
+        ])
+        
+        chess_controls = widgets.VBox([
+            self.chess_square,
+            self.btn_move_square
+        ])
+        
+        main_layout = widgets.VBox([
+            self.status_label,
+            self.distance_slider,
+            widgets.HTML("<hr>"),
+            widgets.HTML("<b>🎮 方向控制:</b>"),
+            widgets.HBox([move_controls, basic_controls]),
+            widgets.HTML("<hr>"),
+            widgets.HTML("<b>🎯 标定控制:</b>"),
+            calibration_controls,
+            widgets.HTML("<hr>"),
+            widgets.HTML("<b>♟️ 棋盘移动:</b>"),
+            chess_controls
+        ])
+        
+        display(main_layout)
+        self.update_status()
+
+
+# 使用示例
+def main():
+    # 创建机械臂实例
+    arm = SuctionArm(port='/dev/ttyUSB0', verbose=True)
+    
+    if not arm.is_connected:
+        print("❌ 无法连接机械臂")
+        return
+    
+    # 显示控制面板
+    arm.show_control_panel()
+    
+    return arm
+
+
+# 运行程序
+if __name__ == "__main__":
+    arm = main()
