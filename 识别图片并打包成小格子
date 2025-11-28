@@ -1,18 +1,12 @@
 # -*- coding: utf-8 -*-
 import cv2
 import numpy as np
-from collections import namedtuple
 import os
 
-# ==================== 配置区 ====================
-IMAGE_PATH = "perfect_board.jpg"          # 你的照片名（放桌面就行）
-OUTPUT_FOLDER = "ChessBoard_64pieces"     # 会自动在桌面创建这个文件夹
-# ===============================================
-
+IMAGE_PATH = "002.jpg"                     # 你的照片
+OUTPUT_FOLDER = "ChessBoard_64pieces"
 width, height = 900, 900
-Point = namedtuple("Point", ["x", "y"])
 
-# ---------- 暴力稳抓四个角标 ----------
 def find_corners_ultra(img):
     img_lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(img_lab)
@@ -22,14 +16,16 @@ def find_corners_ultra(img):
     
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     masks = [
-        cv2.inRange(hsv, (0, 80, 80), (20, 255, 255))   | cv2.inRange(hsv, (160, 80, 80), (180, 255, 255)),
-        cv2.inRange(hsv, (35, 70, 70), (90, 255, 255)),
-        cv2.inRange(hsv, (90, 80, 80), (140, 255, 255)),
-        cv2.inRange(hsv, (120, 50, 80), (179, 255, 255)),
+        cv2.inRange(hsv, (0, 80, 80), (20, 255, 255))   | cv2.inRange(hsv, (160, 80, 80), (180, 255, 255)),  # 红
+        cv2.inRange(hsv, (35, 70, 70), (90, 255, 255)),    # 绿
+        cv2.inRange(hsv, (90, 80, 80), (140, 255, 255)),   # 蓝
+        cv2.inRange(hsv, (120, 50, 80), (179, 255, 255)),  # 粉/紫/黄
     ]
     
     points = []
+    color_names = ["左上(红)", "右上(绿)", "左下(蓝)", "右下(粉)"]
     colors_bgr = [(0,0,255), (0,255,0), (255,0,0), (255,0,255)]
+    
     for i, mask in enumerate(masks):
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41,41))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
@@ -40,89 +36,73 @@ def find_corners_ultra(img):
         M = cv2.moments(c)
         cx = int(M["m10"]/M["m00"])
         cy = int(M["m01"]/M["m00"])
-        points.append(Point(cx, cy))
-        cv2.circle(img, (cx,cy), 60, colors_bgr[i], 20)
+        points.append((cx, cy))
+        
+        # 大圈 + 文字标注
+        cv2.circle(img, (cx, cy), 80, colors_bgr[i], 15)
+        cv2.putText(img, color_names[i], (cx-120, cy-100),
+                   cv2.FONT_HERSHEY_SIMPLEX, 1.8, colors_bgr[i], 6)
     
-    points = sorted(points, key=lambda p: (p.y//(img.shape[0]//3), p.x))
-    top = sorted(points[:2], key=lambda p: p.x)
-    bottom = sorted(points[2:], key=lambda p: p.x)
-    return [top[0], top[1], bottom[0], bottom[1]]
+    # 强制排序：左上 → 右上 → 左下 → 右下
+    points = sorted(points, key=lambda p: (p[1]//(img.shape[0]//3), p[0]))
+    top = sorted(points[:2], key=lambda p: p[0])
+    bot = sorted(points[2:], key=lambda p: p[0])
+    ordered = [top[0], top[1], bot[0], bot[1]]
+    return ordered
 
-# ---------- 透视变换 ----------
 def transform(img, corners):
-    src = np.float32([[p.x,p.y] for p in corners])
-    dst = np.float32([[0,0],[width,0],[0,height],[width,height]])
+    src = np.float32(corners)
+    dst = np.float32([[0,0], [width,0], [0,height], [width,height]])
     M = cv2.getPerspectiveTransform(src, dst)
-    return cv2.warpPerspective(img, M, (width, height))
-
-# ---------- 识别黑白子 ----------
-def detect_square_type(cell):
-    h, w = cell.shape[:2]
-    crop = cell[int(h*0.3):int(h*0.7), int(w*0.3):int(w*0.7)]
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    brightness = cv2.mean(bw)[0]
-    if brightness < 100:   return 'x'  # 黑子
-    elif brightness > 150: return 'o'  # 白子
-    else:                  return ' '
+    warped = cv2.warpPerspective(img, M, (width, height))
+    return warped, M  # 返回变换矩阵，方便后面画网格
 
 # ==================== 主程序 ====================
-# 1. 读取图片
 img = cv2.imread(IMAGE_PATH)
 if img is None:
-    print("错误：没找到图片！请确认 perfect_board.jpg 在桌面")
+    print("图片没找到！")
     exit()
 
-# 2. 找角标 + 透视校正
+print("正在找四个角标...")
 corners = find_corners_ultra(img.copy())
+
 if not corners:
-    print("还是没找到角标！请换一张角标更明显的照片")
-    cv2.imshow("失败", cv2.resize(img, (800,800)))
+    print("没找到四个角标！")
+    cv2.imshow("失败", cv2.resize(img, (900,900)))
     cv2.waitKey(0)
     exit()
 
-warped = transform(img, corners)
+print("成功找到四个角标！顺序是：左上(红) → 右上(绿) → 左下(蓝) → 右下(粉)")
 
-# 3. 自动计算每个格子大小（总像素 / 8，完美等分）
-cell_w = width // 8
-cell_h = height // 8
+warped, M = transform(img, corners)
 
-# 4. 创建输出文件夹（桌面）
+# 在校正后的棋盘上画 8×8 网格线（让你一眼看出对齐准不准）
+grid = warped.copy()
+cell_w, cell_h = width//8, height//8
+for i in range(9):
+    cv2.line(grid, (i*cell_w, 0), (i*cell_w, height), (0,255,255), 4)
+    cv2.line(grid, (0, i*cell_h), (width, i*cell_h), (0,255,255), 4)
+
+# 保存结果
 desktop = os.path.join(os.path.expanduser("~"), "Desktop")
 output_path = os.path.join(desktop, OUTPUT_FOLDER)
 os.makedirs(output_path, exist_ok=True)
-print(f"已创建文件夹：{output_path}")
 
-# 5. 裁剪并保存 64 个小格子 + 构建棋盘
-board = []
+# 裁剪64个小格子（文件名 a8~h1）
 files = "abcdefgh"
 ranks = "87654321"
-
 for y in range(8):
-    row = []
     for x in range(8):
         cell = warped[y*cell_h:(y+1)*cell_h, x*cell_w:(x+1)*cell_w]
-        piece_char = detect_square_type(cell)
-        row.append(piece_char)
-        
-        # 保存为标准文件名：a8.jpg, b8.jpg, ..., h1.jpg
         filename = f"{files[x]}{ranks[y]}.jpg"
-        save_path = os.path.join(output_path, filename)
-        cv2.imwrite(save_path, cell)
-    board.append(row)
+        cv2.imwrite(os.path.join(output_path, filename), cell)
 
-# 6. 打印漂亮棋盘
-print("\n识别大成功！你的棋盘如下：\n")
-print("  a b c d e f g h")
-for i in range(8):
-    print(8-i, " ".join(board[i]))
-print("  a b c d e f g h")
-print(f"\n已成功保存 64 张小格子图片到桌面文件夹：")
-print(f"   {OUTPUT_FOLDER}")
-print("   打开就能看到 a8.jpg 到 h1.jpg 整齐排列！")
+# 显示三张图让你彻底明白
+cv2.imshow("1. 原图 + 四个角标已标注", cv2.resize(img, (900,900)))
+cv2.imshow("2. 透视校正后纯棋盘", warped)
+cv2.imshow("3. 校正后 + 黄色网格线（看对齐准不准）", cv2.resize(grid, (900,900)))
 
-# 7. 显示结果
-cv2.imshow("原图 + 四个角标（绝对找到了）", cv2.resize(img, (800,800)))
-cv2.imshow("完美校正棋盘", warped)
+print("完美！64张小图已保存到桌面 ChessBoard_64pieces 文件夹")
+print("左上角标=红色圆圈，右上=绿色，左下=蓝色，右下=粉色")
 cv2.waitKey(0)
 cv2.destroyAllWindows()
