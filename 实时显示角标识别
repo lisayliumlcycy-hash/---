@@ -1,0 +1,151 @@
+# -*- coding: utf-8 -*-
+# 实时摄像头棋盘识别神器 v3.0  —— 专治你的磁性折叠棋盘
+import cv2
+import numpy as np
+from collections import namedtuple
+import os
+import time
+
+# ================== 配置区 ==================
+SAVE_FOLDER = "实时识别结果"           # 所有结果都保存在桌面这个文件夹
+CAMERA_INDEX = 0                      # 摄像头编号（笔记本一般是0，外接可能是1）
+WIDTH, HEIGHT = 900, 900              # 越大越准
+# ===========================================
+
+Point = namedtuple("Point", ["x", "y"])
+os.makedirs(os.path.join(os.path.expanduser("~"), "Desktop", SAVE_FOLDER), exist_ok=True)
+
+def find_corners_live(frame):
+    enhanced = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8)).apply(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+    enhanced = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+    hsv = cv2.cvtColor(enhanced, cv2.COLOR_BGR2HSV)
+    
+    masks = [
+        cv2.inRange(hsv, (0,80,80),(20,255,255))   | cv2.inRange(hsv, (160,80,80),(180,255,255)),
+        cv2.inRange(hsv, (35,70,70),(90,255,255)),
+        cv2.inRange(hsv, (90,80,80),(140,255,255)),
+        cv2.inRange(hsv, (120,50,80),(179,255,255)),
+    ]
+    
+    points = []
+    for i, mask in enumerate(masks):
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (35,35))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours: return None
+        c = max(contours, key=cv2.contourArea)
+        M = cv2.moments(c)
+        cx = int(M["m10"]/M["m00"])
+        cy = int(M["m01"]/M["m00"])
+        points.append(Point(cx, cy))
+    # 强制排序
+    points = sorted(points, key=lambda p: (p.y//(frame.shape[0]//3), p.x))
+    top = sorted(points[:2], key=lambda p: p.x)
+    bottom = sorted(points[2:], key=lambda p: p.x)
+    return [top[0], top[1], bottom[0], bottom[1]]
+
+def warp_board(img, corners):
+    src = np.float32([[p.x,p.y] for p in corners])
+    dst = np.float32([[0,0],[WIDTH,0],[0,HEIGHT],[WIDTH,HEIGHT]])
+    M = cv2.getPerspectiveTransform(src, dst)
+    return cv2.warpPerspective(img, M, (WIDTH, HEIGHT))
+
+def detect_piece(cell):
+    h,w = cell.shape[:2]
+    crop = cell[int(h*0.3):int(h*0.7), int(w*0.3):int(w*0.7)]
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    brightness = cv2.mean(bw)[0]
+    if brightness < 100:  return 'x'   # 黑子
+    if brightness > 150:  return 'o'   # 白子
+    return ' '
+
+def board_to_fen(board):
+    fen = ""
+    for row in board:
+        empty = 0
+        for cell in row:
+            if cell == ' ':
+                empty += 1
+            else:
+                if empty: fen += str(empty); empty = 0
+                fen += 'P' if cell == 'o' else 'p'
+        if empty: fen += str(empty)
+        fen += "/"
+    fen = fen[:-1] + " w - - 0 1"  # 简单写死白方走
+    return fen
+
+# ============== 主程序 ==============
+cap = cv2.VideoCapture(CAMERA_INDEX)
+cap.set(3, 1280); cap.set(4, 720)
+
+last_save_time = 0
+current_board = None
+
+print("实时棋盘识别神器已启动！\n把棋盘对准摄像头，识别成功会自动保存局面！\n按 q 退出")
+
+while True:
+    ret, frame = cap.read()
+    if not ret: break
+    frame = cv2.flip(frame, 1)  # 镜像翻转更自然
+    
+    corners = find_corners_live(frame.copy())
+    if corners:
+        warped = warp_board(frame, corners)
+        cell_w, cell_h = WIDTH//8, HEIGHT//8
+        board = []
+        for y in range(8):
+            row = []
+            for x in range(8):
+                cell = warped[y*cell_h:(y+1)*cell_h, x*cell_w:(x+1)*cell_w]
+                piece = detect_piece(cell)
+                row.append(piece)
+                # 实时在校正图上画识别结果
+                cv2.putText(warped, piece if piece!=' ' else '.', 
+                           (x*cell_w+30, y*cell_h+80), cv2.FONT_HERSHEY_SIMPLEX, 2, 
+                           (0,255,0) if piece=='o' else (0,0,255) if piece=='x' else (100,100,100), 5)
+            board.append(row)
+        
+        current_board = board
+        
+        # 每10秒自动保存一次（或者你按空格手动保存）
+        if time.time() - last_save_time > 10:
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            save_dir = os.path.join(os.path.expanduser("~"), "Desktop", SAVE_FOLDER, timestamp)
+            os.makedirs(save_dir, exist_ok=True)
+            
+            # 保存校正图
+            cv2.imwrite(os.path.join(save_dir, "warped.jpg"), warped)
+            # 保存64个小格子
+            files = "abcdefgh"
+            ranks = "87654321"
+            for y in range(8):
+                for x in range(8):
+                    cell = warped[y*cell_h:(y+1)*cell_h, x*cell_w:(x+1)*cell_w]
+                    cv2.imwrite(os.path.join(save_dir, f"{files[x]}{ranks[y]}.jpg"), cell)
+            
+            # 保存FEN
+            fen = board_to_fen(board)
+            with open(os.path.join(save_dir, "局面FEN.txt"), "w", encoding="utf-8") as f:
+                f.write(fen + "\n可直接粘贴到 lichess.org/analysis 分析")
+            
+            print(f"\n识别成功！已自动保存局面 → 桌面/{SAVE_FOLDER}/{timestamp}")
+            last_save_time = time.time()
+        
+        cv2.putText(frame, "识别成功！每10秒自动保存", (30,70), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,255,0), 4)
+        cv2.imshow("实时校正棋盘 + 识别结果", cv2.resize(warped, (800,800)))
+    else:
+        cv2.putText(frame, "请把棋盘对准摄像头，四色角标要露出来~", (30,70), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,0,255), 3)
+    
+    cv2.imshow("摄像头实时画面", frame)
+    
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
+        break
+    elif key == ord(' '):  # 按空格手动保存一次
+        if current_board:
+            last_save_time = 0  # 触发立即保存
+
+cap.release()
+cv2.destroyAllWindows()
+print("神器已关闭，玩得开心！")
