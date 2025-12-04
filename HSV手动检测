@@ -41,7 +41,7 @@ cv2.createTrackbar('V Min', 'Trackbars', 0, 255, nothing)
 cv2.createTrackbar('V Max', 'Trackbars', 255, 255, nothing)
 
 # 打开摄像头
-cap = cv2.VideoCapture(0) # 如果是测试图片，请改用 cv2.imread('path.jpg')
+cap = cv2.VideoCapture(2) # 如果是测试图片，请改用 cv2.imread('path.jpg')
 
 # 设置鼠标回调
 cv2.namedWindow('Live Camera')
