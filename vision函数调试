@@ -1,0 +1,368 @@
+from enum import Enum
+from collections import namedtuple
+
+import cv2
+import numpy as np
+import time 
+
+# 注意：请确保 exceptions.py 存在 ChessboardNotFoundError 类，否则需要删除或注释掉这一行
+# from exceptions import ChessboardNotFoundError 
+
+
+# 图像尺寸
+width, height = 640, 480
+# 调试开关，控制是否显示 64 个小方块和 FloodFill 结果
+debug_windows_enabled = True 
+# 棋子识别方法: True 使用亮度统计, False 使用 FloodFill (已废弃)
+use_robust_detection = True 
+
+
+Point = namedtuple("Point", ["x", "y"])
+
+
+# Colors in BGR mode, used by opencv.
+class Colors(Enum):
+    white = (255, 255, 255)
+    black = (0, 0, 0)
+    blue = (255, 0, 0)
+    green = (0, 255, 0)
+    red = (0, 0, 255)
+
+
+# The "type" of a piece is the color of the pattern, not the background.
+class SquareType(Enum):
+    empty = 0
+    white = 1
+    black = 2
+
+    def __str__(self):
+        if self == SquareType.empty:
+            return ' '
+        if self == SquareType.white:
+            return 'o'
+        if self == SquareType.black:
+            return 'x'
+        return None
+
+# ==============================================================================
+# 核心函数: 角点检测 (find_corners)
+# ==============================================================================
+
+# Returns the four corners of the chessboard, or None if not found.
+def find_corners(image):
+    # Draw a circle at [center] with [radius]
+    def draw_circle(image, center, radius=1, color=Colors.white):
+        cv2.circle(image, center, radius, color.value, 2)
+
+    # 形态学操作，用于清除噪点和填充标记点内部空洞
+    def clean_mask(mask, kernel_size=(5, 5)):
+        kernel = np.ones(kernel_size, np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        return mask
+
+    # Return a new image converted to black & white
+    def threshold(image):
+        blurred = cv2.blur(image, (10, 10))
+        ret, thresholded = cv2.threshold(blurred, 200, 255, cv2.THRESH_BINARY)
+        return thresholded
+
+    # Extract center point from largest contour in a black & white image
+    def find_point(image):
+        def center(contour):
+            x, y, w, h = cv2.boundingRect(contour)
+            return Point(x + w // 2, y + h // 2)
+
+        # 兼容 OpenCV 3/4
+        try:
+            _, contours, _ = cv2.findContours(
+                image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+            )
+        except:
+             contours, _ = cv2.findContours(
+                image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+            )
+
+        if len(contours) < 1:
+            return None
+        contour = max(contours, key=cv2.contourArea)
+        return center(contour)
+
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    masks = [
+        # 1. Red 
+        cv2.inRange(hsv, (0, 89, 135), (14, 255, 247)),
+        # 2. Green
+        cv2.inRange(hsv, (52, 69, 77), (72, 226, 254)),
+        # 3. Blue
+        cv2.inRange(hsv, (89, 79, 93), (116, 178, 233)),
+        # 4. Pink/Purple 
+        cv2.inRange(hsv, (136, 55, 71), (150, 255, 212)),
+    ]
+    
+    # 对每个 Mask 先进行形态学清理，再进行阈值处理和找点
+    points = [find_point(threshold(clean_mask(mask))) for mask in masks]
+
+    if not all(points):
+        return None
+
+    # ... (坐标调整部分保持不变) ...
+    x0, y0 = points[0]
+    x1, y1 = points[1]
+    x2, y2 = points[2]
+    x3, y3 = points[3]
+
+    adjusted_points = [
+        Point(
+            int(x0 + (x0 - x1) * 0.00 - (x0 - x2) * 0.05),
+            int(y0 + (y0 - y1) * 0.00 - (y0 - y2) * 0.05),
+        ),
+        Point(
+            int(x1 + (x1 - x0) * 0.08 - (x1 - x3) * 0.05),
+            int(y1 + (y1 - y0) * 0.08 - (y1 - y3) * 0.05),
+        ),
+        Point(
+            int(x2 + (x2 - x3) * 0.02 - (x2 - x0) * 0.05),
+            int(y2 + (y2 - y3) * 0.02 - (y2 - y0) * 0.05),
+        ),
+        Point(
+            int(x3 + (x3 - x2) * 0.08 - (x3 - x1) * 0.05),
+            int(y3 + (y3 - y2) * 0.08 - (y3 - y1) * 0.05),
+        ),
+    ]
+
+    return adjusted_points
+
+
+# Returns a new image after a perspective transform,
+# moving [corners] to the corners of the image.
+def transform(image, corners):
+    src = np.array(
+        [
+            (corners[0].x, corners[0].y),
+            (corners[1].x, corners[1].y),
+            (corners[2].x, corners[2].y),
+            (corners[3].x, corners[3].y),
+        ], np.float32)
+
+    dst = np.array(
+        [
+            (0, 0),
+            (width, 0),
+            (0, height),
+            (width, height),
+        ], np.float32)
+
+    matrix = cv2.getPerspectiveTransform(src, dst)
+    return cv2.warpPerspective(image, matrix, (width, height))
+
+# ==============================================================================
+# 鲁棒识别函数 (detect_square_type_robust)
+# ==============================================================================
+
+def detect_square_type_robust(image):
+    """
+    基于中心区域的平均亮度和标准差统计来识别棋子类型
+    """
+    # 1. 转灰度
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    
+    # 2. 截取中心区域（避开格子边框）
+    h, w = gray.shape
+    roi = gray[int(h*0.2):int(h*0.8), int(w*0.2):int(w*0.8)]
+    
+    # 3. 计算统计量
+    mean_val = np.mean(roi) # 平均亮度 (0-255)
+    std_dev = np.std(roi)  # 标准差（纹理复杂度）
+    
+    if debug_windows_enabled:
+        print(f"[{mean_val:.1f}, {std_dev:.1f}]", end=" ")
+
+    square_type = SquareType.empty
+    
+    # --- 阈值设置 (请根据实际观察调整) ---
+    if mean_val > 180: 
+        square_type = SquareType.white
+    elif mean_val < 60:
+        square_type = SquareType.black
+    else:
+        square_type = SquareType.empty
+        
+    # 创建调试图像: 将 ROI 区域的亮度统计结果画在图像上
+    debug_image = image.copy()
+    cv2.putText(debug_image, f"M:{mean_val:.1f} S:{std_dev:.1f}", (5, 20), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, Colors.red.value, 1)
+    
+    return square_type, debug_image
+
+# 兼容原有的 FloodFill 逻辑，但现在调用鲁棒函数
+def detect_square_type(image):
+    return detect_square_type_robust(image)
+
+# ==============================================================================
+# 主识别流程 (get_position_from_image)
+# ==============================================================================
+
+def get_position_from_image(image):
+    # Crop the image into 8x8 squares.
+    def crop(image, i, j):
+        w = int(width / 8)
+        h = int(height / 8)
+        return image[h * j : h * (j + 1), w * i : w * (i + 1)]
+
+    # 1. 寻找角点
+    corners = find_corners(image)
+    if corners is None:
+        return None
+
+    # 2. 透视变换
+    chessboard_image = transform(image, corners)
+
+    # 3. 调试：显示透视变换图
+    if debug_windows_enabled:
+        cv2.imshow("1. Chessboard Perspective", chessboard_image)
+
+    # 4. 棋子识别和打包可视化结果
+    position = []
+    debug_squares = [] 
+    
+    print("\n--- 识别统计量 [Mean, StdDev] ---")
+    
+    for j in range(8):
+        row = []
+        debug_row = [] 
+        print(f"Rank {8-j}: ", end="")
+        for i in range(8):
+            cropped_square = crop(chessboard_image, i, j)
+            
+            # 调用鲁棒识别函数
+            square_type, debug_img = detect_square_type_robust(cropped_square)
+            
+            row.append(square_type)
+
+            # 在调试图上标记识别结果
+            label = str(square_type)
+            cv2.putText(debug_img, label, (5, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, Colors.blue.value, 2)
+
+            # 水平拼接：[原始格子 | 调试结果 (带统计量)]
+            combined_square = np.hstack((cropped_square, debug_img))
+            debug_row.append(combined_square)
+
+        position.append(row)
+        if debug_windows_enabled:
+            print() # 换行
+            
+        if debug_row:
+            # 垂直拼接 8 个 [原始格子 | 调试结果] 图像
+            debug_squares.append(np.hstack(debug_row)) 
+
+    # 5. 显示打包好的 64 个格子和调试结果
+    if debug_windows_enabled and debug_squares:
+        final_debug_display = np.vstack(debug_squares)
+        
+        # 缩放显示 (避免窗口过大)
+        scale_factor = 0.5
+        display_h, display_w = final_debug_display.shape[:2]
+        final_debug_display_resized = cv2.resize(final_debug_display, 
+                                                (int(display_w * scale_factor), int(display_h * scale_factor)))
+        
+        cv2.imshow("4. 64 Squares + Robust Detection Debug (Resized)", final_debug_display_resized)
+
+    return position
+
+# ==============================================================================
+# 主函数和摄像头调用 - 摄像头索引已修改为 1
+# ==============================================================================
+
+def main():
+    # 🎯 关键修改: 尝试打开指定的摄像头索引 1
+    CAMERA_INDEX = 1
+    print(f"🚀 尝试打开摄像头 (索引 {CAMERA_INDEX})...")
+    cap = cv2.VideoCapture(CAMERA_INDEX) 
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+    # 2. 摄像头可视化等待机制
+    if not cap.isOpened():
+        print(f"❌ 无法打开摄像头 (索引 {CAMERA_INDEX})。请检查设备连接或更改索引。")
+        return
+
+    # 摄像头打开等待/初始化循环
+    print("⏳ 摄像头已连接。正在等待画面稳定...")
+    
+    # 创建一个用于提示的空白图像
+    wait_frame = np.zeros((height, width, 3), dtype=np.uint8)
+    cv2.putText(wait_frame, f"Camera Index {CAMERA_INDEX} Initializing...", (100, 240), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    
+    max_wait_time = 5 # 最多等待 5 秒
+    start_time = time.time()
+    camera_ready = False
+    
+    while time.time() - start_time < max_wait_time:
+        ret, frame = cap.read()
+        
+        if ret:
+            # 读取成功，显示实时画面并确认
+            frame = cv2.resize(frame, (width, height))
+            cv2.imshow("0. Original Image", frame)
+            cv2.waitKey(1)
+            camera_ready = True
+            break
+        else:
+            # 读取失败，显示等待提示，并等待一小段时间
+            cv2.imshow("0. Original Image", wait_frame)
+            cv2.waitKey(50) 
+            time.sleep(0.1)
+
+    if not camera_ready:
+        print("❌ 摄像头长时间未准备就绪。退出。")
+        cap.release()
+        cv2.destroyAllWindows()
+        return
+
+    print("✅ 摄像头画面稳定！按 'q' 键退出。")
+
+    # 3. 主循环开始
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("❌ 无法读取帧。")
+            break
+
+        frame = cv2.resize(frame, (width, height))
+        
+        # 实时更新原始图像窗口
+        cv2.imshow("0. Original Image", frame) 
+        
+        try:
+            position = get_position_from_image(frame)
+            
+            if position:
+                print("\n" + "=" * 20)
+                print("♟️ 识别结果:")
+                print("  a b c d e f g h")
+                print("-" * 17)
+                
+                # 打印 8x8 棋盘
+                for k in range(8):
+                    rank = 8 - k 
+                    row_str = " ".join([str(p) for p in position[k]])
+                    print(f"{rank}|{row_str}")
+                print("=" * 20)
+
+        except Exception as e:
+            print(f"⚠️ 识别过程中发生错误: {e}")
+
+        # 显示所有 OpenCV 窗口，并等待按键
+        key = cv2.waitKey(1)
+        if key & 0xFF == ord('q'):
+            break
+
+    # 清理
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
