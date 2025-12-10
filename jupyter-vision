@@ -1,0 +1,381 @@
+from enum import Enum
+from collections import namedtuple
+import cv2
+import numpy as np
+from io import BytesIO
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+import time
+
+# --- 1. CONFIGURATION (Optimized for Speed) ---
+
+# 图像尺寸 (已降低分辨率以提高速度)
+width, height = 320, 240
+
+# 🎯 准确阈值 (根据用户调试结果确定)
+DEFAULT_WHITE_THRESHOLD = 109 
+DEFAULT_BLACK_THRESHOLD = 120 
+DEFAULT_CUT_MARGIN = 0 
+
+# 颜色常量 (已更新)
+YELLOW_LOWER = (21, 147, 111)  # 使用您调试的最佳值
+YELLOW_UPPER = (41, 255, 255)  # 使用您调试的最佳值
+
+# 棋盘角点颜色掩码 (Red, Green, Blue, Purple)
+CORNER_MASKS_HSV = [
+    ((0, 140, 102), (15, 255, 255)),     # 0: 红色
+    ((62, 75, 50), (82, 255, 255)),      # 1: 绿色
+    ((96, 140, 95), (116, 255, 255)),    # 2: 蓝色 (Updated)
+    ((125, 50, 50), (145, 255, 255)),    # 3: 紫色
+]
+
+# --- 2. BASE CLASSES AND EXCEPTIONS ---
+
+Point = namedtuple("Point", ["x", "y"])
+
+class Colors(Enum):
+    white = (255, 255, 255)
+    black = (0, 0, 0)
+    blue = (255, 0, 0)
+    green = (0, 255, 0)
+    red = (0, 0, 255)
+
+class SquareType(Enum):
+    empty = 0
+    white = 1
+    black = 2
+
+    def __str__(self):
+        if self == SquareType.empty:
+            return ' '
+        if self == SquareType.white:
+            return 'o'
+        if self == SquareType.black:
+            return 'x'
+        return None
+
+class ChessboardNotFoundError(Exception):
+    """当无法找到棋盘角点时引发此异常"""
+    pass
+
+# --- 3. HELPER FUNCTIONS (Function names are preserved) ---
+
+def _clean_mask(mask, kernel_size=(5, 5)):
+    """使用形态学操作清理掩码"""
+    kernel = np.ones(kernel_size, np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel) 
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    return mask
+
+def _threshold_image(image):
+    """对图像进行模糊和二值化"""
+    blurred = cv2.blur(image, (10, 10))
+    _, thresholded = cv2.threshold(blurred, 200, 255, cv2.THRESH_BINARY)
+    return thresholded
+
+def _find_point(image):
+    """从最大轮廓中提取中心点"""
+    def center(contour):
+        x, y, w, h = cv2.boundingRect(contour)
+        return Point(x + w // 2, y + h // 2)
+
+    try:
+        # OpenCV 4.x returns two values
+        contours, _ = cv2.findContours(image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    except:
+        # OpenCV 3.x returns three values
+        _, contours, _ = cv2.findContours(image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if len(contours) < 1:
+        return None
+    contour = max(contours, key=cv2.contourArea)
+    return center(contour)
+
+# Returns the four corners of the chessboard, or None if not found.
+def find_corners(image):
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    
+    # 创建角点颜色掩码
+    masks = [cv2.inRange(hsv, lower, upper) for lower, upper in CORNER_MASKS_HSV]
+    
+    # 查找每个掩码对应的中心点
+    points = [_find_point(_threshold_image(_clean_mask(mask))) for mask in masks]
+
+    if not all(points):
+        return None
+
+    # 从 Point 对象中提取坐标
+    x0, y0 = points[0]
+    x1, y1 = points[1]
+    x2, y2 = points[2]
+    x3, y3 = points[3]
+
+    # 应用微调以修正标记和棋盘边缘的偏差
+    adjusted_points = [
+        Point(int(x0 + (x0 - x1) * 0.00 - (x0 - x2) * 0.05), int(y0 + (y0 - y1) * 0.00 - (y0 - y2) * 0.05)),
+        Point(int(x1 + (x1 - x0) * 0.08 - (x1 - x3) * 0.05), int(y1 + (y1 - y0) * 0.08 - (y1 - y3) * 0.05)),
+        Point(int(x2 + (x2 - x3) * 0.02 - (x2 - x0) * 0.05), int(y2 + (y2 - y3) * 0.02 - (y2 - y0) * 0.05)),
+        Point(int(x3 + (x3 - x2) * 0.08 - (x3 - x1) * 0.05), int(y3 + (y3 - y2) * 0.08 - (y3 - y1) * 0.05)),
+    ]
+    return adjusted_points
+
+
+# Returns a new image after a perspective transform,
+# moving [corners] to the corners of the image.
+def transform(image, corners):
+    src = np.array(
+        [(corners[0].x, corners[0].y), (corners[1].x, corners[1].y), (corners[2].x, corners[2].y), (corners[3].x, corners[3].y)], np.float32)
+
+    dst = np.array(
+        [(0, 0), (width, 0), (0, height), (width, height)], np.float32)
+
+    matrix = cv2.getPerspectiveTransform(src, dst)
+    return cv2.warpPerspective(image, matrix, (width, height))
+
+
+# Return the square type of the given of image.
+# ------------------------------------------------------------------------------
+# 🎯 交互式棋子检测函数
+# ------------------------------------------------------------------------------
+def detect_square_type(image_gray, image_hsv):
+    """
+    使用来自 Jupyter 滑块的实时阈值识别棋格类型。
+    """
+    
+    # 从滑块实时读取最新的阈值
+    white_thresh = W_TH_SLIDER.value
+    black_thresh = B_TH_SLIDER.value
+    yellow_lower = (Y_H_LOW_SLIDER.value, YELLOW_LOWER[1], YELLOW_LOWER[2]) # S, V 使用默认值
+    yellow_upper = (Y_H_HIGH_SLIDER.value, YELLOW_UPPER[1], YELLOW_UPPER[2]) # S, V 使用默认值
+    
+    # ROI 截取（仅截取中心 40%）
+    h, w = image_gray.shape
+    roi_gray = image_gray[int(h*0.3):int(h*0.7), int(w*0.3):int(w*0.7)] 
+    roi_hsv = image_hsv[int(h*0.3):int(h*0.7), int(w*0.3):int(w*0.7)] 
+    
+    mean_val = np.mean(roi_gray) 
+    square_type = SquareType.empty
+    
+    # 1. 颜色过滤检测空位 (黄色背景)
+    yellow_mask = cv2.inRange(roi_hsv, yellow_lower, yellow_upper)
+    # 黄色检测时，S和V的低阈值应该接近0，以检测较淡的黄色。
+    # 这一步使用 S/V 的默认值，主要调整 H。
+    yellow_ratio = cv2.countNonZero(yellow_mask) / roi_gray.size
+    
+    if yellow_ratio > 0.50: 
+        square_type = SquareType.empty
+    
+    # 2. 亮度阈值区分棋子
+    else:
+        # 注意：这里的逻辑应该是：
+        # 如果亮度极高，则为白子；
+        # 如果亮度极低，则为黑子；
+        # 介于两者之间，可能是未被黄色检测到的空位或背景干扰。
+        
+        # 修正您的原始逻辑：白子阈值应高于黑子阈值
+        if mean_val > white_thresh: 
+            square_type = SquareType.white
+        elif mean_val < black_thresh:
+            square_type = SquareType.black
+        else:
+            square_type = SquareType.empty
+            
+    return square_type
+
+
+# ------------------------------------------------------------------------------
+# 🎯 主函数 GET_POSITION_FROM_IMAGE
+# ------------------------------------------------------------------------------
+
+def get_position_from_image(image):
+    """
+    识别图像中的棋盘，并返回对应的 8x8 SquareType 阵列。
+    
+    Args:
+        image: 原始 OpenCV BGR 图像帧。
+        
+    Returns:
+        list[list[SquareType]]: 8x8 棋盘状态。
+        
+    Raises:
+        ChessboardNotFoundError: 如果无法找到角点。
+    """
+    
+    # 1. 裁剪辅助函数
+    def crop(image, i, j, margin_px): 
+        w_sq = int(width / 8)
+        h_sq = int(height / 8)
+        
+        x_start = w_sq * i
+        x_end = w_sq * (i + 1)
+        y_start = h_sq * j
+        y_end = h_sq * (j + 1)
+        
+        return image[y_start + margin_px : y_end - margin_px, 
+                     x_start + margin_px : x_end - margin_px]
+
+    # 2. 缩放输入图像到目标处理分辨率 (320x240)
+    image = cv2.resize(image, (width, height))
+    
+    # 3. 寻找角点并进行透视变换
+    corners = find_corners(image)
+    if corners is None:
+        raise ChessboardNotFoundError()
+
+    chessboard_image = transform(image, corners)
+    
+    # 4. 预转换颜色空间 (仅执行两次，提升性能)
+    chessboard_gray = cv2.cvtColor(chessboard_image, cv2.COLOR_BGR2GRAY)
+    chessboard_hsv = cv2.cvtColor(chessboard_image, cv2.COLOR_BGR2HSV)
+    
+    margin_px = DEFAULT_CUT_MARGIN
+
+    position = []
+    
+    # 5. 遍历 8x8 棋格并识别
+    for j in range(8):
+        row = []
+        for i in range(8):
+            # 裁剪 Gray 和 HSV 图像切片
+            cropped_gray = crop(chessboard_gray, i, j, margin_px)
+            cropped_hsv = crop(chessboard_hsv, i, j, margin_px)
+            
+            # 传入预转换的切片进行快速识别
+            square_type = detect_square_type(cropped_gray, cropped_hsv)
+            
+            row.append(square_type)
+
+        position.append(row)
+
+    return position, chessboard_image  # 返回棋盘图像用于显示
+
+
+# ------------------------------------------------------------------------------
+# 📢 Jupyter 专用版本
+# ------------------------------------------------------------------------------
+
+# 创建显示部件
+original_widget = widgets.Image(format='jpeg', width=width, height=height)
+chessboard_widget = widgets.Image(format='jpeg', width=width, height=height)
+# --- 1. 定义交互式滑块 Widgets (用于棋子检测) ---
+
+# 白子灰度阈值 (高于此值为白子)
+W_TH_SLIDER = widgets.IntSlider(
+    value=110, min=50, max=250, step=1,
+    description='白子阈值:',
+    layout=widgets.Layout(width='300px'), style={'description_width': 'initial'}
+)
+
+# 黑子灰度阈值 (低于此值为黑子)
+B_TH_SLIDER = widgets.IntSlider(
+    value=150, min=50, max=250, step=1,
+    description='黑子阈值:',
+    layout=widgets.Layout(width='300px'), style={'description_width': 'initial'}
+)
+
+# 黄色 H 下限 (用于空位检测)
+Y_H_LOW_SLIDER = widgets.IntSlider(
+    value=26, min=0, max=180, step=1,
+    description='黄H下限:',
+    layout=widgets.Layout(width='300px'), style={'description_width': 'initial'}
+)
+
+# 黄色 H 上限 (用于空位检测)
+Y_H_HIGH_SLIDER = widgets.IntSlider(
+    value=46, min=0, max=180, step=1,
+    description='黄H上限:',
+    layout=widgets.Layout(width='300px'), style={'description_width': 'initial'}
+)
+
+# 组合滑块进行显示
+detection_sliders = widgets.VBox([
+    widgets.Label("♟️ 棋子检测实时调试 (灰度基于 0-255, HSV H基于 0-180)"),
+    widgets.HBox([W_TH_SLIDER, B_TH_SLIDER]),
+    widgets.HBox([Y_H_LOW_SLIDER, Y_H_HIGH_SLIDER])
+])
+
+# 将滑块显示在最前面 (或者您选择的任何位置)
+display(detection_sliders)
+output_area = widgets.Output()
+
+# 显示部件
+display(widgets.HBox([widgets.VBox([
+    widgets.Label("原始图像"),
+    original_widget
+]), widgets.VBox([
+    widgets.Label("矫正后棋盘"),
+    chessboard_widget
+])]))
+display(output_area)
+
+# 摄像头初始化
+CAMERA_INDEX = 0
+cap = cv2.VideoCapture(CAMERA_INDEX)
+
+if not cap.isOpened():
+    print(f"❌ 无法打开摄像头 (索引 {CAMERA_INDEX})")
+    exit()
+
+print(f"✅ 摄像头已打开")
+print(f"📏 处理分辨率: {width}x{height}")
+print("🔄 正在启动... (按停止按钮中断)")
+
+frame_counter = 0
+is_running = True
+
+def stop_capture(change):
+    global is_running
+    is_running = False
+    print("🛑 用户中断")
+
+# 创建停止按钮
+stop_button = widgets.Button(description="停止")
+stop_button.on_click(stop_capture)
+display(stop_button)
+
+try:
+    while is_running:
+        # 读取摄像头帧
+        ret, frame = cap.read()
+        if not ret:
+            print("❌ 无法读取帧")
+            break
+        
+        # 显示原始图像
+        _, buffer_original = cv2.imencode(".jpg", cv2.resize(frame, (width, height)))
+        original_widget.value = buffer_original.tobytes()
+        
+        # 每30帧处理一次棋盘识别
+        if frame_counter % 30 == 0:
+            with output_area:
+                clear_output(wait=True)
+                try:
+                    # 识别棋盘
+                    position, chessboard_img = get_position_from_image(frame)
+                    
+                    # 显示矫正后的棋盘图像
+                    _, buffer_chessboard = cv2.imencode(".jpg", chessboard_img)
+                    chessboard_widget.value = buffer_chessboard.tobytes()
+                    
+                    # 输出棋盘状态
+                    print(f"📊 第 {frame_counter} 帧 - 棋盘状态:")
+                    print("+" + "-" * 8 + "+")
+                    for row in position:
+                        row_str = "|" + "".join([str(p) for p in row]) + "|"
+                        print(row_str)
+                    print("+" + "-" * 8 + "+")
+                    
+                except ChessboardNotFoundError:
+                    print(f"第 {frame_counter} 帧: ⚠️ 未检测到棋盘角点")
+                except Exception as e:
+                    print(f"第 {frame_counter} 帧: ❌ 错误: {e}")
+        
+        frame_counter += 1
+        time.sleep(0.033)  # 大约30fps
+
+except Exception as e:
+    print(f"❌ 程序错误: {e}")
+finally:
+    cap.release()
+    print("✅ 摄像头已释放")
+    print("🎯 程序结束")
