@@ -1,0 +1,153 @@
+from serial.tools import list_ports
+from pydobot import Dobot
+
+class Arm:
+    """
+    控制 Dobot 机械臂进行国际象棋棋子移动。
+    """
+    
+    # 机械臂初始参考位置 (x, y, z, r)
+    X0 = 240.9
+    Y0 = -11.2
+    Z0 = -10
+    R0 = 0
+    
+    # 棋子移除区坐标 (棋盘逻辑坐标)
+    CAPTURE_X = 3 
+    CAPTURE_Y = -3
+    
+    # 棋盘几何参数：根据棋子所在的行 (x) 调整
+    BOARD_GEOMETRY = {
+        'far': {'dx': 18.6, 'dy': 22.5, 'dz_lift': 15, 'dz_grab': -17, 'x_threshold': 4}, # x > 4 (远离机械臂)
+        'near': {'dx': 19.0, 'dy': 22.7, 'dz_lift': 10, 'dz_grab': -10, 'x_threshold': 4} # x <= 4 (靠近机械臂)
+    }
+
+    def __init__(self):
+        """初始化机械臂连接"""
+        try:
+            port = list_ports.comports()[0].device
+            self.device = Dobot(port=port, verbose=False)
+            print(f"✅ Dobot connected on port: {port}")
+        except IndexError:
+            self.device = None
+            print("❌ No Dobot device found. Running in simulation mode.")
+        
+        if self.device:
+            self.device.speed(200, 200) # 设置一个默认速度
+            self.reset()
+
+
+    def _get_piece_params(self, x):
+        """根据行索引 x 获取几何参数"""
+        if x > self.BOARD_GEOMETRY['far']['x_threshold']:
+            return self.BOARD_GEOMETRY['far']
+        return self.BOARD_GEOMETRY['near']
+
+
+    def _get_arm_coordinates(self, x, y):
+        """将棋盘坐标 (x, y) 转换为机械臂 (X, Y, Z_lift, Z_grab) 坐标"""
+        params = self._get_piece_params(x)
+        
+        X = self.X0 + (x - 3) * params['dx']
+        Y = self.Y0 + (y - 3) * params['dy']
+        Z_lift = self.Z0 + params['dz_lift']
+        Z_grab = self.Z0 + params['dz_grab']
+        
+        return X, Y, Z_lift, Z_grab
+        
+
+    def reset(self):
+        """将机械臂复位到等待位置"""
+        if not self.device: return
+        
+        print("🔄 Resetting arm position...")
+        
+        # 原始代码中的一系列移动
+        self.device.move_to(self.X0, self.Y0, self.Z0, self.R0, wait=True)
+        self.device.move_to(self.X0, -79.3, self.Z0, self.R0, wait=True)
+        self.device.move_to(self.X0, 79.6, self.Z0, self.R0, wait=True)
+        self.device.move_to(self.X0, self.Y0, self.Z0, self.R0, wait=True)
+        self.device.move_to(202.9, self.Y0, -5, self.R0, wait=True)
+        self.device.move_to(296.7, self.Y0, -15, self.R0, wait=True)
+        
+        print("✅ Reset complete.")
+
+
+    def _move_piece(self, x1, y1, x2, y2):
+        """
+        从棋盘坐标 (x1, y1) 移动棋子到 (x2, y2)
+        """
+        if not self.device: 
+            print(f"SIMULATION: Move piece from ({x1}, {y1}) to ({x2}, {y2})")
+            return
+
+        # 获取起始点坐标
+        X1, Y1, Z1_lift, Z1_grab = self._get_arm_coordinates(x1, y1)
+        
+        # 1. 移动到起始点上方
+        self.device.move_to(X1, Y1, Z1_lift, self.R0, wait=True)
+        
+        # 2. 下降吸取
+        self.device.move_to(X1, Y1, Z1_grab, self.R0, wait=True)
+        self.device.suck(True) # 开始吸取
+        
+        # 3. 抬升
+        self.device.move_to(X1, Y1, Z1_lift, self.R0, wait=True)
+
+        # 4. 获取目标点坐标
+        X2, Y2, Z2_lift, Z2_grab = self._get_arm_coordinates(x2, y2)
+        
+        # 5. 移动到目标点上方
+        self.device.move_to(X2, Y2, Z2_lift, self.R0, wait=True)
+        
+        # 6. 下降释放
+        self.device.move_to(X2, Y2, Z2_grab, self.R0, wait=True)
+        self.device.suck(False) # 停止吸取 (释放棋子)
+        
+        # 7. 抬升
+        self.device.move_to(X2, Y2, Z2_lift, self.R0, wait=True)
+        print(f"✅ Move complete: ({x1}, {y1}) -> ({x2}, {y2})")
+
+
+    def act(self, board, move):
+        """
+        执行一个移动动作，包括吃子和王车易位等特殊情况。
+        """
+        # 将 UCI 移动转换为棋盘索引 (0-7)，7 - (square // 8) 用于将 Rank 8 映射到 x=0
+        x1 = 7 - (move.from_square // 8)
+        y1 = move.from_square % 8
+        x2 = 7 - (move.to_square // 8)
+        y2 = move.to_square % 8
+
+        print(board)
+        print(f"Act: Moving piece from ({x1}, {y1}) to ({x2}, {y2})")
+        
+        if board.is_capture(move):
+            # 1. 吃子：将被吃掉的棋子 (x2, y2) 移到移除区
+            print(f"➡️ Capture detected: Moving captured piece from ({x2}, {y2}) to capture area.")
+            self._move_piece(x2, y2, self.CAPTURE_X, self.CAPTURE_Y)
+            # 2. 执行主要的棋子移动
+            self._move_piece(x1, y1, x2, y2)
+            
+        elif board.is_kingside_castling(move):
+            print("➡️ Kingside Castling detected.")
+            # 1. 移动王
+            self._move_piece(x1, y1, x2, y2)
+            # 2. 移动王侧车 (原始代码: x1, 7 -> x2, 5)
+            self._move_piece(x1, 7, x2, 5)
+            
+        elif board.is_queenside_castling(move):
+            print("➡️ Queenside Castling detected.")
+            # 1. 移动王
+            self._move_piece(x1, y1, x2, y2)
+            # 2. 移动后侧车 (原始代码: x1, 0 -> x2, 3)
+            self._move_piece(x1, 0, x2, 3)
+            
+        else:
+            # 普通移动
+            self._move_piece(x1, y1, x2, y2)
+            
+        self.reset()
+
+
+这个是一个封装良好的代码吗？我要怎么调用它
