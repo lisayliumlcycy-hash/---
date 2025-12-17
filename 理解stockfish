@@ -1,0 +1,50 @@
+import chess
+import chess.engine
+
+# 配置你的 Stockfish 路径
+STOCKFISH_PATH = "stockfish.exe"
+
+def main():
+    try:
+        # 启动引擎
+        engine = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
+        
+        # 1. 设定一个局面 (这里以一个著名的残局局面为例)
+        # 如果你想用初始局面，直接用 chess.Board()
+        fen = "4r3/p1k2p2/B1p2p2/2b4p/7P/2P3P1/PP3PK1/1R6 b - - 2 24"
+        board = chess.Board(fen)
+        
+        print("--- 当前棋盘状态 ---")
+        print(board)
+        print(f"\n当前 FEN: {board.fen()}")
+        print(f"轮到哪方走棋: {'白方' if board.turn == chess.WHITE else '黑方'}")
+        print("-" * 20)
+
+        # 2. 设置分析参数
+        # multipv=3 表示让引擎给出前三名的走法建议
+        # limit 指定计算到 20 层深度停止
+        print("Stockfish 正在深度思考中...")
+        info = engine.analyse(board, chess.engine.Limit(depth=20), multipv=3)
+
+        # 3. 解析并打印结果
+        for i, entry in enumerate(info):
+            move = entry.get("pv")[0]  # 建议的第一步走法
+            score = entry.get("score").relative  # 获取相对分值
+            
+            # 分数处理：如果是将死，显示 M(步数)；否则显示 centipawns (100cp = 1兵)
+            if score.is_mate():
+                score_str = f"Mate in {abs(score.mate())}"
+            else:
+                score_str = f"{score.score() / 100.0:+0.2f}"
+
+            print(f"建议 {i+1}: {move} | 分数: {score_str} | 深度: {entry.get('depth')}")
+
+    except Exception as e:
+        print(f"运行出错: {e}")
+    finally:
+        # 务必关闭引擎，否则进程会残留在后台
+        engine.quit()
+        print("\n引擎已安全关闭。")
+
+if __name__ == "__main__":
+    main()
