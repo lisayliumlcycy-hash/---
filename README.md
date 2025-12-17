@@ -40,7 +40,7 @@ vision封装，可调用
 
 前两天学了国际象棋规则，今天自己调算法代码
 
-https://lichess.org/analysis，该网站可以将可视盘面转写为FEN（这是Board函数中用于描写盘面全部信息的代码）；
+https://lichess.org/analysis ，该网站可以将可视盘面转写为FEN（这是Board函数中用于描写盘面全部信息的代码）；
 
-https://www.chess.com/learn，我在这里学习国际象棋规则。
+https://www.chess.com/learn ，我在这里学习国际象棋规则。
 
