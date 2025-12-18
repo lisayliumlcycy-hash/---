@@ -44,3 +44,7 @@ https://lichess.org/analysis ，该网站可以将可视盘面转写为FEN（这
 
 https://www.chess.com/learn ，我在这里学习国际象棋规则。
 
+20251218
+
+幸福来得要比预想更快一些~接下来可以想想报告了……
+
