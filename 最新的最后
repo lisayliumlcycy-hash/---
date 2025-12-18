@@ -1,0 +1,238 @@
+import cv2
+import time
+import chess
+import chess.engine
+import os
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+from collections import namedtuple
+from serial.tools import list_ports
+from pydobot import Dobot
+
+# 导入你的视觉模块
+from vision import get_position_from_image, SquareType, ChessboardNotFoundError, width, height
+
+# --- 1. 配置 Stockfish 路径 ---
+SF_PATH = "/home/HwHiAiUser/_2400012735/stockfish/stockfish-android-armv8"
+if os.path.exists(SF_PATH):
+    os.chmod(SF_PATH, 0o755)
+
+# --- 2. 机械臂控制类 (Arm Class) ---
+class Arm:
+    x0 = 240.9
+    y0 = -11.2
+    z0 = -10
+    device = None
+
+    def __init__(self):
+        ports = list_ports.comports()
+        if not ports:
+            raise Exception("未找到串口设备，请检查机械臂连接")
+        port = ports[0].device
+        self.device = Dobot(port=port, verbose=False)
+
+    def reset(self):
+        """
+        严格保留校准与避让序列
+        """
+        self.device.move_to(self.x0, self.y0, self.z0, 0, wait=True)
+        self.device.move_to(self.x0, -79.3, self.z0, 0, wait=True)
+        self.device.move_to(self.x0, 79.6, self.z0, 0, wait=True)
+        self.device.move_to(self.x0, self.y0, self.z0, 0, wait=True)
+        self.device.move_to(202.9, self.y0, -5, 0, wait=True)
+        self.device.move_to(296.7, self.y0, -15, 0, wait=True)
+
+    def act(self, board, move):
+        """执行动作：处理吃子、易位、普通移动"""
+        x1 = move.from_square // 8
+        y1 = 7 - (move.from_square % 8)
+        x2 = move.to_square // 8
+        y2 = 7 - (move.to_square % 8)
+
+        if board.is_capture(move):
+            self._move_piece(x2, y2, 3, -3)
+        
+        if board.is_kingside_castling(move):
+            self._move_piece(x1, y1, x2, y2)
+            self._move_piece(x1, 0, x1, 2)
+        elif board.is_queenside_castling(move):
+            self._move_piece(x1, y1, x2, y2)
+            self._move_piece(x1, 7, x1, 4)
+        else:
+            self._move_piece(x1, y1, x2, y2)
+
+    def _move_piece(self, x1, y1, x2, y2):
+        if x1 > 4:
+            dx, dy, dz, dz2 = 18.6, 22.5, 15, -17
+        else:
+            dx, dy, dz, dz2 = 19.0, 22.7, 10, -10
+
+        self.device.move_to(self.x0, self.y0, self.z0 + dz, 0, wait=True)
+        self.device.move_to(self.x0 + (x1 - 3) * dx, self.y0 + (y1 - 3) * dy, self.z0 + dz, 0, wait=True)
+        self.device.move_to(self.x0 + (x1 - 3) * dx, self.y0 + (y1 - 3) * dy, self.z0 + dz2, 0, wait=True)
+        self.device.suck(True)
+        self.device.move_to(self.x0 + (x1 - 3) * dx, self.y0 + (y1 - 3) * dy, self.z0 + dz, 0, wait=True)
+
+        if x2 > 4:
+            dx, dy, dz, dz2 = 18.6, 22.5, 15, -15
+        else:
+            dx, dy, dz, dz2 = 19.0, 22.7, 10, -10
+
+        self.device.move_to(self.x0 + (x2 - 3) * dx, self.y0 + (y2 - 3) * dy, self.z0 + dz, 0, wait=True)
+        self.device.move_to(self.x0 + (x2 - 3) * dx, self.y0 + (y2 - 3) * dy, self.z0 + dz2, 0, wait=True)
+        self.device.suck(False)
+        self.device.move_to(self.x0 + (x2 - 3) * dx, self.y0 + (y2 - 3) * dy, self.z0 + dz, 0, wait=True)
+        self.device.move_to(self.x0 + (2 - 3) * dx, self.y0 + (-3 - 3) * dy, self.z0 + dz, 0, wait=True)
+
+# --- 3. 辅助功能与指示输出 ---
+Square = namedtuple("Square", ["x", "y"])
+
+def get_internal_position(board):
+    res = []
+    for x in range(8):
+        row = []
+        for y in range(8):
+            piece = board.piece_at(chess.square(7-y, x))
+            if piece is None: row.append(SquareType.empty)
+            elif piece.color == chess.WHITE: row.append(SquareType.white)
+            else: row.append(SquareType.black)
+        res.append(tuple(row))
+    return tuple(res)
+
+def matrix_to_uci(square):
+    files = "hgfedcba"
+    ranks = "12345678"
+    return files[square.y] + ranks[square.x]
+
+def print_debug_board(position):
+    print("    " + " ".join(["h","g","f","e","d","c","b","a"]))
+    for x in reversed(range(8)):
+        row_str = f"{x+1} |"
+        for y in range(8):
+            val = str(position[x][y]).split('.')[-1][0] 
+            row_str += f" {val}"
+        print(row_str + f" | {x+1}")
+    print("    " + " ".join(["h","g","f","e","d","c","b","a"]))
+
+# --- 4. 主逻辑 ---
+def main():
+    video_widget = widgets.Image(format='jpeg', width=width, height=height)
+    debug_output = widgets.Output(layout={'border': '1px solid gray', 'height': '420px', 'overflow_y': 'scroll'})
+    status_label = widgets.Label(value="🟢 初始化硬件中...")
+    suggestion_box = widgets.HTML(value="<b>🤖 AI 建议:</b> 等待开局...")
+    
+    display(widgets.VBox([
+        status_label,
+        suggestion_box,
+        widgets.HBox([video_widget, debug_output])
+    ]))
+
+    cap = cv2.VideoCapture(0)
+    board = chess.Board()
+    frame_counter = 0
+    
+    try:
+        arm = Arm()
+        status_label.value = "🦾 机械臂正在执行初始化路径 (避让摄像头)..."
+        arm.reset() 
+        arm.device.move_to(221.9, -141.34, 15, 0, wait=True)
+        with debug_output: print("✅ 机械臂已移至避让位置")
+        
+        engine = chess.engine.SimpleEngine.popen_uci(SF_PATH)
+        with debug_output: print("✅ Stockfish 加载成功")
+    except Exception as e:
+        with debug_output: print(f"❌ 启动失败: {e}")
+        return
+
+    current_logic_pos = get_internal_position(board)
+    last_seen_pos = None
+    stable_count = 0
+    STABLE_THRESHOLD = 15
+
+    status_label.value = "🟢 系统就绪，请白方走子"
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret: break
+            frame_counter += 1
+
+            _, buffer = cv2.imencode('.jpg', frame)
+            video_widget.value = buffer.tobytes()
+
+            try:
+                vision_pos, _ = get_position_from_image(frame)
+                vision_pos = tuple(tuple(r) for r in vision_pos)
+
+                if frame_counter % 30 == 0:
+                    with debug_output:
+                        clear_output(wait=True)
+                        print(f"--- 帧: {frame_counter} 实时识别结果 ---")
+                        print_debug_board(vision_pos)
+                        print(f"当前轮到: {'白' if board.turn else '黑'} 方")
+
+                # --- 核心修改：走子检测显示变化格数 ---
+                if vision_pos != current_logic_pos:
+                    # 计算当前识别到的变化格数
+                    diffs_now = [Square(x, y) for x in range(8) for y in range(8) 
+                                 if current_logic_pos[x][y] != vision_pos[x][y]]
+                    num_diffs = len(diffs_now)
+
+                    if vision_pos == last_seen_pos:
+                        stable_count += 1
+                        # 【在此处添加了“检测到 N 个变化”】
+                        status_label.value = f"⏳ 检测到 {num_diffs} 个变化 ({stable_count})"
+                    else:
+                        stable_count = 0
+                        last_seen_pos = vision_pos
+                        status_label.value = f"👀 识别到 {num_diffs} 个格子在动..."
+                    
+                    if stable_count >= STABLE_THRESHOLD:
+                        # 稳定后的逻辑
+                        diffs = diffs_now
+                        
+                        if len(diffs) >= 2:
+                            starts = [p for p in diffs if vision_pos[p.x][p.y] == SquareType.empty]
+                            if starts:
+                                start = starts[0]
+                                end = [p for p in diffs if p != start][0]
+                                move_uci = matrix_to_uci(start) + matrix_to_uci(end)
+                                
+                                try:
+                                    move = chess.Move.from_uci(move_uci)
+                                    if move in board.legal_moves:
+                                        board.push(move)
+                                        with debug_output: print(f"🎯 成功识别移动: {move_uci}")
+                                        
+                                        status_label.value = "🤖 AI 思考中并操作机械臂..."
+                                        result = engine.play(board, chess.engine.Limit(time=1.0))
+                                        ai_move = result.move
+                                        
+                                        # 机械臂操作
+                                        arm.reset()
+                                        arm.act(board, ai_move)
+                                        
+                                        board.push(ai_move)
+                                        current_logic_pos = get_internal_position(board)
+                                        
+                                        suggestion_box.value = f"<b>🤖 AI 上一步动作:</b> {ai_move}"
+                                        status_label.value = "✅ 请走子..."
+                                    else:
+                                        status_label.value = f"⚠️ 非法动作: {move_uci}"
+                                except Exception as e:
+                                    with debug_output: print(f"解析错误: {e}")
+                        stable_count = 0
+                else:
+                    stable_count = 0
+
+            except ChessboardNotFoundError:
+                status_label.value = "🔍 未找到棋盘..."
+            
+            time.sleep(0.01)
+
+    finally:
+        cap.release()
+        engine.quit()
+
+if __name__ == "__main__":
+    main()
