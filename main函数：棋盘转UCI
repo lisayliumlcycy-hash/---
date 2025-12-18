@@ -1,0 +1,145 @@
+import cv2
+import time
+import chess
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+from collections import namedtuple
+
+# 导入你的自定义模块
+from vision import get_position_from_image, SquareType, ChessboardNotFoundError, width, height
+
+# --- 1. 适配器与工具函数 ---
+Square = namedtuple("Square", ["x", "y"])
+
+def get_internal_position(board):
+    """将逻辑棋盘转为视觉矩阵"""
+    res = []
+    for x in range(8):
+        row = []
+        for y in range(8):
+            rank_idx = x  # x=0 为 Rank 1
+            file_idx = 7 - y # y=7 为 File a (0)
+            piece = board.piece_at(chess.square(file_idx, rank_idx))
+            if piece is None: row.append(SquareType.empty)
+            elif piece.color == chess.WHITE: row.append(SquareType.white)
+            else: row.append(SquareType.black)
+        res.append(tuple(row))
+    return tuple(res)
+
+def matrix_to_uci(square):
+    """视觉坐标转 UCI 字符串"""
+    files = "hgfedcba" # y=0是h, y=7是a
+    ranks = "12345678" # x=0是1, x=7是8
+    return files[square.y] + ranks[square.x]
+
+def print_debug_board(position):
+    """美化打印 8x8 识别矩阵"""
+    print("   " + " ".join(["h","g","f","e","d","c","b","a"])) # 列标
+    for x in reversed(range(8)): # 为了视觉上让第8行在上面
+        row_str = f"{x+1} |"
+        for y in range(8):
+            row_str += f" {str(position[x][y])}"
+        print(row_str + f" | {x+1}")
+    print("   " + " ".join(["h","g","f","e","d","c","b","a"]))
+
+# --- 2. 主循环 ---
+
+def main():
+    # A. 布局组件
+    video_widget = widgets.Image(format='jpeg', width=width, height=height)
+    debug_output = widgets.Output(layout={'border': '1px solid gray', 'height': '250px', 'overflow_y': 'scroll'})
+    status_label = widgets.Label(value="🟢 系统启动中...")
+    
+    display(widgets.VBox([
+        status_label,
+        widgets.HBox([video_widget, debug_output])
+    ]))
+
+    # B. 初始化
+    cap = cv2.VideoCapture(0)
+    board = chess.Board()
+    current_logic_pos = get_internal_position(board)
+    
+    last_seen_pos = None
+    stable_count = 0
+    STABLE_THRESHOLD = 8
+    frame_counter = 0
+
+    with debug_output:
+        print("🚀 初始同步完成。请开始走子...")
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret: break
+            frame_counter += 1
+
+            # 实时更新画面
+            _, buffer = cv2.imencode('.jpg', frame)
+            video_widget.value = buffer.tobytes()
+
+            try:
+                # 1. 视觉识别
+                vision_pos, _ = get_position_from_image(frame)
+                vision_pos = tuple(tuple(r) for r in vision_pos)
+
+                # 2. 定时打印识别出的棋盘 (每30帧)
+                if frame_counter % 30 == 0:
+                    with debug_output:
+                        clear_output(wait=True)
+                        print(f"--- 帧: {frame_counter} 实时识别矩阵 ---")
+                        print_debug_board(vision_pos)
+                        print(f"当前轮到: {'白' if board.turn else '黑'} 方")
+
+                # 3. 走子检测逻辑
+                if vision_pos != current_logic_pos:
+                    if vision_pos == last_seen_pos:
+                        stable_count += 1
+                        status_label.value = f"⏳ 检测到变化，移开手... ({stable_count})"
+                    else:
+                        stable_count = 0
+                        last_seen_pos = vision_pos
+                    
+                    if stable_count >= STABLE_THRESHOLD:
+                        diffs = [Square(x, y) for x in range(8) for y in range(8) 
+                                 if current_logic_pos[x][y] != vision_pos[x][y]]
+                        
+                        with debug_output:
+                            print(f"\n🔔 检测到稳定变动！变动格数: {len(diffs)}")
+                        
+                        if len(diffs) == 2:
+                            # 确定起点：视觉上变为空格的格子
+                            starts = [p for p in diffs if vision_pos[p.x][p.y] == SquareType.empty]
+                            if len(starts) == 1:
+                                start = starts[0]
+                                end = [p for p in diffs if p != start][0]
+                                move_uci = matrix_to_uci(start) + matrix_to_uci(end)
+                                
+                                try:
+                                    move = chess.Move.from_uci(move_uci)
+                                    if move in board.legal_moves:
+                                        print(f"🎯 成功识别走子: {move_uci}")
+                                        board.push(move)
+                                        current_logic_pos = get_internal_position(board)
+                                        status_label.value = f"✅ 走子成功: {move_uci}"
+                                    else:
+                                        with debug_output: print(f"❌ 非法动作: {move_uci}")
+                                        status_label.value = f"⚠️ 非法动作: {move_uci}"
+                                except:
+                                    pass
+                        stable_count = 0
+                else:
+                    stable_count = 0
+            
+            except ChessboardNotFoundError:
+                status_label.value = "🔍 寻找棋盘中..."
+            
+            time.sleep(0.01)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        cap.release()
+
+if __name__ == "__main__":
+    main()
