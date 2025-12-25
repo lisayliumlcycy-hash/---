@@ -4,7 +4,11 @@
 
 欢迎阅读《食用指南》！这是作者在完成实验之后整理的操作顺序/建议。
 
-该项目参考了https://github.com/yizhepku/Raspberry-Chess/blob/master/arm.py ；该项目是作者在“智能硬件应用实验”课程中尝试的项目，感谢！
+该项目参考了https://github.com/yizhepku/Raspberry-Chess/blob/master/arm.py ；
+
+该项目是作者在“智能硬件应用实验”课程中尝试的项目，以上感谢！
+
+代码大多附有注释，可以多多探索代码History。
 
 实验进度：
 
@@ -66,8 +70,12 @@ https://www.chess.com/learn ，我在这里学习国际象棋规则。
 
 整理操作流程
 
-开题报告和结题汇报，供参考：
 
-开题汇报：
+开题、结题报告供参考：
 
-结题汇报：
+开题报告 https://ccnv8xq1y43m.feishu.cn/wiki/WCsdw9A4tiVqbQkUq0ccP70lnce
+
+结题报告（视频文件大，去除视频） https://ccnv8xq1y43m.feishu.cn/wiki/M3CXwiNEjiCbgtkv7Eec82w9nmb
+
+
+开源许可请参见LICENSE。
